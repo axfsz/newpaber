@@ -432,12 +432,27 @@ def ensure_user_display(chat_id: int, uid: int, triplet: Tuple[str,str,str]):
     return un, fn, ln
 
 def rank_display_name(chat_id: int, uid: int, un: str, fn: str, ln: str) -> str:
-    """积分/统计榜显示名称：优先 @username；否则昵称；否则 ID。"""
+    """
+    榜单显示规则（统一用“姓名”）：
+    1) 优先显示 姓名 = first_name + last_name（去掉多余空格）
+    2) 如果姓名都没有，再显示 @username
+    3) 都没有时显示 ID:xxxx
+    同时调用 ensure_user_display() 刷新一次缓存，尽量拿到最新资料。
+    """
     un, fn, ln = ensure_user_display(chat_id, uid, (un, fn, ln))
+
+    # 先拼姓名（有就用姓名）
+    full = f"{(fn or '').strip()} {(ln or '').strip()}".strip()
+    if full:
+        return full
+
+    # 姓名都没有才用用户名
     if un:
         return f"@{un}"
-    disp = (fn or "") + (ln or "")
-    return disp.strip() or f"ID:{uid}"
+
+    # 最后兜底 ID
+    return f"ID:{uid}"
+
 
 def list_top_day(chat_id: int, day: str, limit: int = 10):
     # 优先使用 scores 中的最新 username/first/last，保证显示 @username
