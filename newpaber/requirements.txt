@@ -1,0 +1,13 @@
+feedparser==6.0.11
+python-dateutil==2.9.0.post0
+pytz==2024.1
+requests==2.32.3
+googletrans==4.0.0-rc1
+python-dotenv==1.0.1
+# HTTP 调用 Telegram API
+requests==2.32.3
+
+# HTML 文本清洗（新闻摘要）
+beautifulsoup4==4.12.3
+pymysql
+
