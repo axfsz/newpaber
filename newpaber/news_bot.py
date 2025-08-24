@@ -5,8 +5,9 @@ Telegram 群机器人 - 新闻 / 统计 / 积分 / 广告 / 曝光台 / 自定�
 数据层：MySQL（PyMySQL）
 
 本版特性：
-- 榜单名称统一按“姓名（first+last）> @username > ID”显示，并且可点击跳转私聊 tg://user?id=UID
-- 新增每日 23:59 日终播报（活跃人数 + 积分 Top10 + 发言 Top10）
+- 榜单名称统一按“姓名（first+last）> @username > ID”显示，并且**可点击跳转私聊**；
+  链接优先用 https://t.me/<username>，无用户名才用 tg://user?id=<UID>
+- 每日 23:59 日终播报（活跃人数 + 积分 Top10 + 发言 Top10）
 - 管理员按钮“🏁 立即结算今日日榜奖励”
 - 中文新闻翻译输出（可通过 .env 开关）
 """
@@ -100,7 +101,7 @@ STATS_CHAT_IDS = [int(x) for x in re.split(r"[,\s]+", os.getenv("STATS_CHAT_IDS"
 AD_DEFAULT_ENABLED = os.getenv("AD_DEFAULT_ENABLED", "1") == "1"
 WELCOME_PANEL_ENABLED = os.getenv("WELCOME_PANEL_ENABLED", "1") == "1"
 
-# 招商按钮（两种配置方式）
+# 招商按钮
 BIZ_LINKS = os.getenv("BIZ_LINKS", "").strip()  # 形如：招商A|https://t.me/xxx;招商B|https://t.me/yyy
 BIZ_A_LABEL = os.getenv("BIZ_A_LABEL", "招商A")
 BIZ_A_URL   = os.getenv("BIZ_A_URL", "").strip()
@@ -434,19 +435,24 @@ def ensure_user_display(chat_id: int, uid: int, triplet: Tuple[str,str,str]):
         return un2, fn2, ln2
     return un, fn, ln
 
-# —— 可点击的人名链接 —— #
-def html_mention(uid: int, text: str) -> str:
-    """生成可点击的用户跳转链接（tg://user?id=...）。"""
-    return f'<a href="tg://user?id={uid}">{safe_html(text)}</a>'
+# —— 可点击的人名链接（修复版：优先 t.me/username） —— #
+def _user_link(uid: Optional[int], username: Optional[str]) -> str:
+    username = (username or "").strip()
+    if username:
+        return f"https://t.me/{username}"
+    # 无用户名时用 tg scheme
+    return f"tg://user?id={uid}" if uid else "tg://user"
 
 def rank_display_link(chat_id: int, uid: int, un: str, fn: str, ln: str) -> str:
     """
     榜单显示统一：姓名（first+last）> @username > ID，返回为可点击 HTML 链接。
+    链接优先 https://t.me/<username>，否则退回 tg://user?id=<UID>
     """
     un, fn, ln = ensure_user_display(chat_id, uid, (un, fn, ln))
     full = f"{(fn or '').strip()} {(ln or '').strip()}".strip()
     label = full or (f"@{un}" if un else f"ID:{uid}")
-    return html_mention(uid, label)
+    href = _user_link(uid, un)
+    return f'<a href="{href}">{safe_html(label)}</a>'
 
 # —— 排名查询（与 scores 联表，拿到最新姓名/用户名） —— #
 def list_top_day(chat_id: int, day: str, limit: int = 10):
