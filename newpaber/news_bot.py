@@ -750,10 +750,11 @@ def build_rules_text(chat_id: int) -> str:
         "  4️⃣ 1000 分",
         "  5️⃣–🔟 各 600 分",
         "",
-        f"🗓️ <b>每日签到</b>：每天 +{SCORE_CHECKIN_POINTS} 分（30 天≈30 分）",
+        f"🗓️ <b>每日签到</b>：每天 +{SCORE_CHECKIN_POINTS} 分",
         f"💬 <b>发言统计</b>：消息≥{MIN_MSG_CHARS} 字计入；支持日/月统计与奖励",
         f"🤝 <b>邀请加分</b>：成功邀请 +{INVITE_REWARD_POINTS} 分；被邀请人退群 -{INVITE_REWARD_POINTS} 分",
         f"💱 <b>兑换</b>：{REDEEM_RATE} 分 = 1 U；<b>满 {REDEEM_MIN_POINTS} 分</b>方可兑换",
+        f"❌ <b>清零</b>：离群清零，或者兑换完清零.",
     ]
     en, _ct, mode, _times = ad_get(chat_id)
     if en and mode == "attach":
