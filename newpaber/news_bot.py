@@ -4,8 +4,9 @@
 Telegram 群机器人 - 新闻 / 统计 / 积分 / 广告(附加/定时) / 曝光台 / 入群欢迎面板 / 自定义新闻 / 招商按钮
 数据层：MySQL（PyMySQL）
 
-新增：
-- 菜单尾部追加“招商”URL 按钮（从 .env 读取 BIZ_LINKS 或 BIZ_A/B_*）。
+本版更新：
+- 所有榜单统一优先显示 @username（没有则回落到昵称或 ID）
+- 新增每日 23:59 日终播报（积分 Top10 + 发言 Top10 + 活跃人数）
 """
 
 import os
@@ -85,8 +86,9 @@ REDEEM_MIN_POINTS = int(os.getenv("REDEEM_MIN_POINTS", "10000"))
 INVITE_REWARD_POINTS = int(os.getenv("INVITE_REWARD_POINTS", "10"))
 
 # 调度时间
-STATS_DAILY_AT = os.getenv("STATS_DAILY_AT", "23:50")
-STATS_MONTHLY_AT = os.getenv("STATS_MONTHLY_AT", "00:10")
+STATS_DAILY_AT = os.getenv("STATS_DAILY_AT", "23:50")      # 日统计推送 & 发言 Top 奖励
+STATS_MONTHLY_AT = os.getenv("STATS_MONTHLY_AT", "00:10")  # 月统计
+DAILY_BROADCAST_AT = os.getenv("DAILY_BROADCAST_AT", "23:59")  # 日终播报（本次新增）
 
 # 目标群（可为空 -> 从数据库里自动扫描）
 NEWS_CHAT_IDS = [int(x) for x in re.split(r"[,\s]+", os.getenv("NEWS_CHAT_IDS", "").strip()) if x.isdigit()]
@@ -429,6 +431,14 @@ def ensure_user_display(chat_id: int, uid: int, triplet: Tuple[str,str,str]):
         return un2, fn2, ln2
     return un, fn, ln
 
+def rank_display_name(chat_id: int, uid: int, un: str, fn: str, ln: str) -> str:
+    """积分/统计榜显示名称：优先 @username；否则昵称；否则 ID。"""
+    un, fn, ln = ensure_user_display(chat_id, uid, (un, fn, ln))
+    if un:
+        return f"@{un}"
+    disp = (fn or "") + (ln or "")
+    return disp.strip() or f"ID:{uid}"
+
 def list_top_day(chat_id: int, day: str, limit: int = 10):
     return _fetchall(
         """SELECT user_id, MAX(username), MAX(first_name), MAX(last_name), SUM(cnt) AS c
@@ -442,6 +452,11 @@ def list_top_month(chat_id: int, ym: str, limit: int = 10):
            FROM msg_counts WHERE chat_id=%s AND day LIKE CONCAT(%s,'-%')
            GROUP BY user_id ORDER BY c DESC LIMIT %s""",
         (chat_id, ym, limit)
+    )
+def list_score_top(chat_id: int, limit: int = 10):
+    return _fetchall(
+        "SELECT user_id, username, first_name, last_name, points FROM scores WHERE chat_id=%s ORDER BY points DESC LIMIT %s",
+        (chat_id, limit)
     )
 
 def eligible_member_count(chat_id: int) -> int:
@@ -508,8 +523,8 @@ def build_daily_report(chat_id: int, day: str) -> str:
     if not rows:
         lines.append("暂无数据。"); return "\n".join(lines)
     for i,(uid,un,fn,ln,c) in enumerate(rows,1):
-        un,fn,ln = ensure_user_display(chat_id, uid, (un,fn,ln))
-        lines.append(f"{i}. {safe_html(human_name(un,fn,ln))} — <b>{c}</b>")
+        name = rank_display_name(chat_id, uid, un, fn, ln)
+        lines.append(f"{i}. {safe_html(name)} — <b>{c}</b>")
     return "\n".join(lines)
 
 def build_monthly_report(chat_id: int, ym: str) -> str:
@@ -525,8 +540,33 @@ def build_monthly_report(chat_id: int, ym: str) -> str:
     if not rows:
         lines.append("暂无数据。"); return "\n".join(lines)
     for i,(uid,un,fn,ln,c) in enumerate(rows,1):
-        un,fn,ln = ensure_user_display(chat_id, uid, (un,fn,ln))
-        lines.append(f"{i}. {safe_html(human_name(un,fn,ln))} — <b>{c}</b>")
+        name = rank_display_name(chat_id, uid, un, fn, ln)
+        lines.append(f"{i}. {safe_html(name)} — <b>{c}</b>")
+    return "\n".join(lines)
+
+def build_day_broadcast(chat_id: int, day: str) -> str:
+    """日终播报：活跃人数 + 积分Top10 + 发言Top10（均显示 @username）"""
+    speakers = _fetchone("SELECT COUNT(DISTINCT user_id) FROM msg_counts WHERE chat_id=%s AND day=%s", (chat_id, day))[0] or 0
+    lines = [f"🕛 <b>{day} 日终播报</b>", f"🧑‍🤝‍🧑 活跃人数：<b>{speakers}</b>", "<code>────────────────</code>"]
+    # 积分 Top10（总积分）
+    rows_s = list_score_top(chat_id, 10)
+    lines.append("🏆 <b>积分榜 Top10</b>")
+    if not rows_s:
+        lines.append("（暂无积分数据）")
+    else:
+        for i,(uid,un,fn,ln,pts) in enumerate(rows_s,1):
+            name = rank_display_name(chat_id, uid, un, fn, ln)
+            lines.append(f"{i}. {safe_html(name)} — <b>{pts}</b> 分")
+    lines.append("<code>────────────────</code>")
+    # 发言 Top10（当日）
+    rows_m = list_top_day(chat_id, day, 10)
+    lines.append("💬 <b>发言 Top10</b>")
+    if not rows_m:
+        lines.append("（今日暂无发言数据）")
+    else:
+        for i,(uid,un,fn,ln,c) in enumerate(rows_m,1):
+            name = rank_display_name(chat_id, uid, un, fn, ln)
+            lines.append(f"{i}. {safe_html(name)} — <b>{c}</b> 条")
     return "\n".join(lines)
 
 # ========== 曝光台 ==========
@@ -725,18 +765,15 @@ def build_menu(is_admin_user: bool, chat_id: Optional[int]=None) -> dict:
         kb.append([ikb("🗞 立即推送新闻","ACT_NEWS_NOW")])
         kb.append([ikb("➕ 添加曝光","ACT_EXP_ADD"), ikb("🧹 清空曝光","ACT_EXP_CLEAR"),
                    ikb("🟢 开启曝光" if not expose_enabled(chat_id) else "🔴 关闭曝光","ACT_EXP_TOGGLE")])
-
     # —— 菜单尾部：招商按钮（URL 跳转）
     biz_btns = get_biz_buttons()
     if biz_btns:
-        # 2~3 个一行排布
         row: List[dict] = []
         for b in biz_btns:
             row.append(b)
             if len(row) == 3:
                 kb.append(row); row = []
         if row: kb.append(row)
-
     return {"inline_keyboard": kb}
 
 def build_rules_text(chat_id: int) -> str:
@@ -821,11 +858,9 @@ def handle_chat_member_update(obj: Dict):
     # 加入：left/kicked -> member/administrator/restricted
     if old_status in ("left","kicked") and new_status in ("member","administrator","restricted"):
         inviter = None
-        # 1) 通过邀请链接加入：用 link 的创建者作为邀请人
         creator = (invite_link.get("creator") or {})
         if creator.get("id"):
             inviter = creator
-        # 2) 管理员手动拉人：from 即邀请人
         elif changer.get("id") and changer.get("id") != target_user.get("id"):
             inviter = changer
         _upsert_user_base(chat_id, target_user)
@@ -984,13 +1019,12 @@ def handle_general_command(msg: Dict) -> bool:
     if cmd == "/score_top":
         limit = SCORE_TOP_LIMIT
         if len(parts)>=2 and parts[1].isdigit(): limit = max(1,min(50,int(parts[1])))
-        rows = _fetchall("SELECT user_id,username,first_name,last_name,points FROM scores WHERE chat_id=%s ORDER BY points DESC LIMIT %s",
-                         (chat_id, limit))
+        rows = list_score_top(chat_id, limit)
         if not rows: send_message_html(chat_id,"暂无积分数据。"); return True
         lines = ["🏆 <b>积分榜</b>","<code>────────────────</code>"]
         for i,(uid2,u,f,l,p) in enumerate(rows,1):
-            u,f,l = ensure_user_display(chat_id, uid2, (u,f,l))
-            lines.append(f"{i}. {safe_html(human_name(u,f,l))} — <b>{p}</b> 分")
+            name = rank_display_name(chat_id, uid2, u, f, l)
+            lines.append(f"{i}. {safe_html(name)} — <b>{p}</b> 分")
         send_message_html(chat_id,"\n".join(lines)); return True
 
     if cmd in ("/score_add","/score_deduct"):
@@ -1004,7 +1038,7 @@ def handle_general_command(msg: Dict) -> bool:
         delta = -abs(delta) if cmd=="/score_deduct" else abs(delta)
         _upsert_user_base(chat_id, {"id":tgt_id,"username":un,"first_name":fn,"last_name":ln})
         _add_points(chat_id, tgt_id, delta, uid, cmd[1:])
-        send_message_html(chat_id, f"✅ 已为 {safe_html(human_name(un,fn,ln))} 变更积分：{'+' if delta>0 else ''}{delta}，当前积分 <b>{_get_points(chat_id,tgt_id)}</b>"); return True
+        send_message_html(chat_id, f"✅ 已为 {safe_html(rank_display_name(chat_id,tgt_id,un,fn,ln))} 变更积分：{'+' if delta>0 else ''}{delta}，当前积分 <b>{_get_points(chat_id,tgt_id)}</b>"); return True
 
     if cmd == "/stats_day":
         day = (tz_now()-timedelta(days=1)).strftime("%Y-%m-%d")
@@ -1067,14 +1101,13 @@ def handle_callback(cb: Dict):
             answer_callback_query(cb_id, f"当前积分：{_get_points(chat_id, uid)}"); return
 
         if data == "ACT_TOP10":
-            rows = _fetchall("SELECT user_id,username,first_name,last_name,points FROM scores WHERE chat_id=%s ORDER BY points DESC LIMIT %s",
-                             (chat_id, SCORE_TOP_LIMIT))
+            rows = list_score_top(chat_id, SCORE_TOP_LIMIT)
             if not rows: send_message_html(chat_id,"暂无积分数据。")
             else:
                 lines = ["🏆 <b>积分榜</b>", "<code>────────────────</code>"]
                 for i,(uid2,u,f,l,p) in enumerate(rows,1):
-                    u,f,l = ensure_user_display(chat_id, uid2, (u,f,l))
-                    lines.append(f"{i}. {safe_html(human_name(u,f,l))} — <b>{p}</b> 分")
+                    name = rank_display_name(chat_id, uid2, u, f, l)
+                    lines.append(f"{i}. {safe_html(name)} — <b>{p}</b> 分")
                 send_message_html(chat_id,"\n".join(lines))
             answer_callback_query(cb_id); return
 
@@ -1198,7 +1231,6 @@ def handle_new_members(msg: Dict):
     members = msg.get("new_chat_members") or []
     for m in members:
         _upsert_user_base(chat_id, m or {})
-        # 管理员“拉人”场景：message.from 即邀请人
         if inviter and inviter.get("id") and inviter.get("id") != (m or {}).get("id"):
             _bind_invite_if_needed(chat_id, m, inviter)
     if WELCOME_PANEL_ENABLED and members:
@@ -1410,6 +1442,21 @@ def maybe_monthly_report():
             logger.exception("monthly report error")
         state_set(rk, "1")
 
+def maybe_daily_broadcast():
+    """23:59 日终播报：积分Top10 + 发言Top10 + 活跃人数（当日发过言的人数）"""
+    h,m = parse_hhmm(DAILY_BROADCAST_AT); now = tz_now()
+    if now.hour!=h or now.minute!=m: return
+    day = now.strftime("%Y-%m-%d")
+    chats = STATS_CHAT_IDS or gather_known_chats()
+    for cid in chats:
+        rk = f"daily_broadcast:{cid}:{day}"
+        if state_get(rk): continue
+        try:
+            send_message_html(cid, build_day_broadcast(cid, day))
+        except Exception:
+            logger.exception("daily broadcast error", extra={"chat_id": cid})
+        state_set(rk, "1")
+
 def maybe_ad_schedule():
     """定时广告：到点发送（当天同一时间点仅发一次）"""
     now = tz_now()
@@ -1433,6 +1480,7 @@ def scheduler_step():
     maybe_push_news()
     maybe_daily_report()
     maybe_monthly_report()
+    maybe_daily_broadcast()
     maybe_ad_schedule()
 
 # ========== 启动 ==========
