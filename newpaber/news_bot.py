@@ -1,12 +1,14 @@
 #!/usr/bin/env python3
 # -*- coding: utf-8 -*-
 """
-Telegram 群机器人 - 新闻 / 统计 / 积分 / 广告(附加/定时) / 曝光台 / 入群欢迎面板 / 自定义新闻 / 招商按钮
+Telegram 群机器人 - 新闻 / 统计 / 积分 / 广告 / 曝光台 / 自定义新闻 / 招商按钮
 数据层：MySQL（PyMySQL）
 
-本版更新：
-- 所有榜单统一优先显示 @username（没有则回落到昵称或 ID）
-- 新增每日 23:59 日终播报（积分 Top10 + 发言 Top10 + 活跃人数）
+本版特性：
+- 榜单名称统一按“姓名（first+last）> @username > ID”显示，并且可点击跳转私聊 tg://user?id=UID
+- 新增每日 23:59 日终播报（活跃人数 + 积分 Top10 + 发言 Top10）
+- 管理员按钮“🏁 立即结算今日日榜奖励”
+- 中文新闻翻译输出（可通过 .env 开关）
 """
 
 import os
@@ -54,7 +56,7 @@ MYSQL_DB   = os.getenv("MYSQL_DB", "newsbot")
 MYSQL_USER = os.getenv("MYSQL_USER", "root")
 MYSQL_PASSWORD = os.getenv("MYSQL_PASSWORD", "")
 
-# 超时
+# 轮询/HTTP 超时
 POLL_TIMEOUT = int(os.getenv("POLL_TIMEOUT", "50"))
 HTTP_TIMEOUT = int(os.getenv("HTTP_TIMEOUT", "65"))
 
@@ -78,7 +80,7 @@ MONTHLY_REWARD_RULE = os.getenv(
 )
 MONTHLY_REWARD_RULE = [int(x) for x in json.loads(MONTHLY_REWARD_RULE)][:10]
 
-# 兑换：100 分 = 1U；且积分需要 ≥ REDEEM_MIN_POINTS 才能兑换
+# 兑U：100 分 = 1 U；兑换门槛分
 REDEEM_RATE = int(os.getenv("REDEEM_RATE", "100"))
 REDEEM_MIN_POINTS = int(os.getenv("REDEEM_MIN_POINTS", "10000"))
 
@@ -88,7 +90,7 @@ INVITE_REWARD_POINTS = int(os.getenv("INVITE_REWARD_POINTS", "10"))
 # 调度时间
 STATS_DAILY_AT = os.getenv("STATS_DAILY_AT", "23:50")      # 日统计推送 & 发言 Top 奖励
 STATS_MONTHLY_AT = os.getenv("STATS_MONTHLY_AT", "00:10")  # 月统计
-DAILY_BROADCAST_AT = os.getenv("DAILY_BROADCAST_AT", "23:59")  # 日终播报（本次新增）
+DAILY_BROADCAST_AT = os.getenv("DAILY_BROADCAST_AT", "23:59")  # 日终播报
 
 # 目标群（可为空 -> 从数据库里自动扫描）
 NEWS_CHAT_IDS = [int(x) for x in re.split(r"[,\s]+", os.getenv("NEWS_CHAT_IDS", "").strip()) if x.isdigit()]
@@ -98,7 +100,7 @@ STATS_CHAT_IDS = [int(x) for x in re.split(r"[,\s]+", os.getenv("STATS_CHAT_IDS"
 AD_DEFAULT_ENABLED = os.getenv("AD_DEFAULT_ENABLED", "1") == "1"
 WELCOME_PANEL_ENABLED = os.getenv("WELCOME_PANEL_ENABLED", "1") == "1"
 
-# 招商按钮（可两种写法：BIZ_LINKS 或 A/B 键）
+# 招商按钮（两种配置方式）
 BIZ_LINKS = os.getenv("BIZ_LINKS", "").strip()  # 形如：招商A|https://t.me/xxx;招商B|https://t.me/yyy
 BIZ_A_LABEL = os.getenv("BIZ_A_LABEL", "招商A")
 BIZ_A_URL   = os.getenv("BIZ_A_URL", "").strip()
@@ -181,9 +183,10 @@ def parse_hhmm(s: str) -> Tuple[int, int]:
 def safe_html(s: str) -> str:
     return html.escape(s or "", quote=False)
 def human_name(username: str, first: str, last: str) -> str:
+    if first or last:
+        return f"{(first or '').strip()} {(last or '').strip()}".strip()
     if username: return f"@{username}"
-    full = f"{first or ''} {last or ''}".strip()
-    return full or "（匿名）"
+    return "（匿名）"
 
 # ========== Telegram API ==========
 def http_get(method: str, params=None, json_data=None, files=None, timeout: Optional[int] = None):
@@ -431,31 +434,22 @@ def ensure_user_display(chat_id: int, uid: int, triplet: Tuple[str,str,str]):
         return un2, fn2, ln2
     return un, fn, ln
 
-def rank_display_name(chat_id: int, uid: int, un: str, fn: str, ln: str) -> str:
+# —— 可点击的人名链接 —— #
+def html_mention(uid: int, text: str) -> str:
+    """生成可点击的用户跳转链接（tg://user?id=...）。"""
+    return f'<a href="tg://user?id={uid}">{safe_html(text)}</a>'
+
+def rank_display_link(chat_id: int, uid: int, un: str, fn: str, ln: str) -> str:
     """
-    榜单显示规则（统一用“姓名”）：
-    1) 优先显示 姓名 = first_name + last_name（去掉多余空格）
-    2) 如果姓名都没有，再显示 @username
-    3) 都没有时显示 ID:xxxx
-    同时调用 ensure_user_display() 刷新一次缓存，尽量拿到最新资料。
+    榜单显示统一：姓名（first+last）> @username > ID，返回为可点击 HTML 链接。
     """
     un, fn, ln = ensure_user_display(chat_id, uid, (un, fn, ln))
-
-    # 先拼姓名（有就用姓名）
     full = f"{(fn or '').strip()} {(ln or '').strip()}".strip()
-    if full:
-        return full
+    label = full or (f"@{un}" if un else f"ID:{uid}")
+    return html_mention(uid, label)
 
-    # 姓名都没有才用用户名
-    if un:
-        return f"@{un}"
-
-    # 最后兜底 ID
-    return f"ID:{uid}"
-
-
+# —— 排名查询（与 scores 联表，拿到最新姓名/用户名） —— #
 def list_top_day(chat_id: int, day: str, limit: int = 10):
-    # 优先使用 scores 中的最新 username/first/last，保证显示 @username
     return _fetchall(
         """
         SELECT
@@ -474,8 +468,8 @@ def list_top_day(chat_id: int, day: str, limit: int = 10):
         """,
         (chat_id, day, limit)
     )
+
 def list_top_month(chat_id: int, ym: str, limit: int = 10):
-    # 同上，月度聚合也优先取 scores 中的 username
     return _fetchall(
         """
         SELECT
@@ -494,6 +488,7 @@ def list_top_month(chat_id: int, ym: str, limit: int = 10):
         """,
         (chat_id, ym, limit)
     )
+
 def list_score_top(chat_id: int, limit: int = 10):
     return _fetchall(
         "SELECT user_id, username, first_name, last_name, points FROM scores WHERE chat_id=%s ORDER BY points DESC LIMIT %s",
@@ -564,8 +559,8 @@ def build_daily_report(chat_id: int, day: str) -> str:
     if not rows:
         lines.append("暂无数据。"); return "\n".join(lines)
     for i,(uid,un,fn,ln,c) in enumerate(rows,1):
-        name = rank_display_name(chat_id, uid, un, fn, ln)
-        lines.append(f"{i}. {safe_html(name)} — <b>{c}</b>")
+        name_link = rank_display_link(chat_id, uid, un, fn, ln)
+        lines.append(f"{i}. {name_link} — <b>{c}</b>")
     return "\n".join(lines)
 
 def build_monthly_report(chat_id: int, ym: str) -> str:
@@ -581,23 +576,23 @@ def build_monthly_report(chat_id: int, ym: str) -> str:
     if not rows:
         lines.append("暂无数据。"); return "\n".join(lines)
     for i,(uid,un,fn,ln,c) in enumerate(rows,1):
-        name = rank_display_name(chat_id, uid, un, fn, ln)
-        lines.append(f"{i}. {safe_html(name)} — <b>{c}</b>")
+        name_link = rank_display_link(chat_id, uid, un, fn, ln)
+        lines.append(f"{i}. {name_link} — <b>{c}</b>")
     return "\n".join(lines)
 
 def build_day_broadcast(chat_id: int, day: str) -> str:
-    """日终播报：活跃人数 + 积分Top10 + 发言Top10（均显示 @username）"""
+    """日终播报：活跃人数 + 积分Top10 + 发言Top10（均为可点击姓名）"""
     speakers = _fetchone("SELECT COUNT(DISTINCT user_id) FROM msg_counts WHERE chat_id=%s AND day=%s", (chat_id, day))[0] or 0
     lines = [f"🕛 <b>{day} 日终播报</b>", f"🧑‍🤝‍🧑 活跃人数：<b>{speakers}</b>", "<code>────────────────</code>"]
-    # 积分 Top10（总积分）
+    # 积分 Top10
     rows_s = list_score_top(chat_id, 10)
     lines.append("🏆 <b>积分榜 Top10</b>")
     if not rows_s:
         lines.append("（暂无积分数据）")
     else:
         for i,(uid,un,fn,ln,pts) in enumerate(rows_s,1):
-            name = rank_display_name(chat_id, uid, un, fn, ln)
-            lines.append(f"{i}. {safe_html(name)} — <b>{pts}</b> 分")
+            name_link = rank_display_link(chat_id, uid, un, fn, ln)
+            lines.append(f"{i}. {name_link} — <b>{pts}</b> 分")
     lines.append("<code>────────────────</code>")
     # 发言 Top10（当日）
     rows_m = list_top_day(chat_id, day, 10)
@@ -606,8 +601,8 @@ def build_day_broadcast(chat_id: int, day: str) -> str:
         lines.append("（今日暂无发言数据）")
     else:
         for i,(uid,un,fn,ln,c) in enumerate(rows_m,1):
-            name = rank_display_name(chat_id, uid, un, fn, ln)
-            lines.append(f"{i}. {safe_html(name)} — <b>{c}</b> 条")
+            name_link = rank_display_link(chat_id, uid, un, fn, ln)
+            lines.append(f"{i}. {name_link} — <b>{c}</b> 条")
     return "\n".join(lines)
 
 # ========== 曝光台 ==========
@@ -806,6 +801,7 @@ def build_menu(is_admin_user: bool, chat_id: Optional[int]=None) -> dict:
         kb.append([ikb("🗞 立即推送新闻","ACT_NEWS_NOW")])
         kb.append([ikb("➕ 添加曝光","ACT_EXP_ADD"), ikb("🧹 清空曝光","ACT_EXP_CLEAR"),
                    ikb("🟢 开启曝光" if not expose_enabled(chat_id) else "🔴 关闭曝光","ACT_EXP_TOGGLE")])
+        kb.append([ikb("🏁 立即结算今日日榜奖励","ACT_AWARD_TODAY")])
     # —— 菜单尾部：招商按钮（URL 跳转）
     biz_btns = get_biz_buttons()
     if biz_btns:
@@ -828,6 +824,7 @@ def build_rules_text(chat_id: int) -> str:
         "  4️⃣ 1000 分",
         "  5️⃣–🔟 各 600 分",
         "",
+
         f"🗓️ <b>每日签到</b>：每天 +{SCORE_CHECKIN_POINTS} 分",
         f"💬 <b>发言统计</b>：消息≥{MIN_MSG_CHARS} 字计入；支持日/月统计与奖励",
         f"🤝 <b>邀请加分</b>：成功邀请 +{INVITE_REWARD_POINTS} 分；被邀请人退群 -{INVITE_REWARD_POINTS} 分",
@@ -872,7 +869,6 @@ def cnews_list_message(chat_id: int, status: str):
 
 # ========== 邀请识别（自动绑定/加分 & 退群扣分） ==========
 def _bind_invite_if_needed(chat_id: int, invitee: Dict, inviter: Optional[Dict]):
-    """给邀请人加分（若尚未绑定）。inviter 可能为 None（链接无法识别时跳过）"""
     if not invitee or not invitee.get("id"): return
     invitee_id = invitee["id"]
     if inviter and inviter.get("id") and inviter["id"] != invitee_id:
@@ -884,19 +880,18 @@ def _bind_invite_if_needed(chat_id: int, invitee: Dict, inviter: Optional[Dict])
             _add_points(chat_id, inviter["id"], INVITE_REWARD_POINTS, inviter["id"], "invite_auto_join")
 
 def handle_chat_member_update(obj: Dict):
-    """处理 chat_member 更新，识别邀请人及退群"""
     chat = obj.get("chat") or {}; chat_id = chat.get("id")
-    changer = obj.get("from") or {}               # 执行操作的管理员
+    changer = obj.get("from") or {}
     oldm = obj.get("old_chat_member") or {}
     newm = obj.get("new_chat_member") or {}
-    invite_link = obj.get("invite_link") or {}    # 通过邀请链接加入时提供
+    invite_link = obj.get("invite_link") or {}
     old_status = (oldm.get("status") or "").lower()
     new_status = (newm.get("status") or "").lower()
-    target_user = (newm.get("user") or {})        # 被变更的成员
+    target_user = (newm.get("user") or {})
 
     if not chat_id or not target_user: return
 
-    # 加入：left/kicked -> member/administrator/restricted
+    # 加入
     if old_status in ("left","kicked") and new_status in ("member","administrator","restricted"):
         inviter = None
         creator = (invite_link.get("creator") or {})
@@ -908,7 +903,7 @@ def handle_chat_member_update(obj: Dict):
         _bind_invite_if_needed(chat_id, target_user, inviter)
         return
 
-    # 退群：member/restricted -> left/kicked
+    # 退群
     if old_status in ("member","restricted") and new_status in ("left","kicked"):
         invitee_id = (oldm.get("user") or {}).get("id") or target_user.get("id")
         if not invitee_id: return
@@ -940,7 +935,7 @@ def target_user_from_msg(msg: Dict):
                 return (chat_id, uid, un, fn, ln)
     return (None,None,None,None,None)
 
-# ========== 命令（保留，按钮主用） ==========
+# ========== 命令 ==========
 def handle_admin_ad_command(msg: Dict) -> bool:
     chat_id = (msg.get("chat") or {}).get("id")
     frm = msg.get("from") or {}; uid = frm.get("id")
@@ -1064,8 +1059,7 @@ def handle_general_command(msg: Dict) -> bool:
         if not rows: send_message_html(chat_id,"暂无积分数据。"); return True
         lines = ["🏆 <b>积分榜</b>","<code>────────────────</code>"]
         for i,(uid2,u,f,l,p) in enumerate(rows,1):
-            name = rank_display_name(chat_id, uid2, u, f, l)
-            lines.append(f"{i}. {safe_html(name)} — <b>{p}</b> 分")
+            lines.append(f'{i}. {rank_display_link(chat_id, uid2, u, f, l)} — <b>{p}</b> 分')
         send_message_html(chat_id,"\n".join(lines)); return True
 
     if cmd in ("/score_add","/score_deduct"):
@@ -1079,7 +1073,7 @@ def handle_general_command(msg: Dict) -> bool:
         delta = -abs(delta) if cmd=="/score_deduct" else abs(delta)
         _upsert_user_base(chat_id, {"id":tgt_id,"username":un,"first_name":fn,"last_name":ln})
         _add_points(chat_id, tgt_id, delta, uid, cmd[1:])
-        send_message_html(chat_id, f"✅ 已为 {safe_html(rank_display_name(chat_id,tgt_id,un,fn,ln))} 变更积分：{'+' if delta>0 else ''}{delta}，当前积分 <b>{_get_points(chat_id,tgt_id)}</b>"); return True
+        send_message_html(chat_id, f"✅ 已为 {rank_display_link(chat_id,tgt_id,un,fn,ln)} 变更积分：{'+' if delta>0 else ''}{delta}，当前积分 <b>{_get_points(chat_id,tgt_id)}</b>"); return True
 
     if cmd == "/stats_day":
         day = (tz_now()-timedelta(days=1)).strftime("%Y-%m-%d")
@@ -1147,8 +1141,7 @@ def handle_callback(cb: Dict):
             else:
                 lines = ["🏆 <b>积分榜</b>", "<code>────────────────</code>"]
                 for i,(uid2,u,f,l,p) in enumerate(rows,1):
-                    name = rank_display_name(chat_id, uid2, u, f, l)
-                    lines.append(f"{i}. {safe_html(name)} — <b>{p}</b> 分")
+                    lines.append(f'{i}. {rank_display_link(chat_id, uid2, u, f, l)} — <b>{p}</b> 分')
                 send_message_html(chat_id,"\n".join(lines))
             answer_callback_query(cb_id); return
 
@@ -1259,6 +1252,37 @@ def handle_callback(cb: Dict):
         if data == "ACT_NEWS_NOW":
             if not admin: answer_callback_query(cb_id,"无权限",show_alert=True); return
             push_news_once(chat_id); state_set("next_news_at",(tz_now()+timedelta(minutes=INTERVAL_MINUTES)).isoformat()); answer_callback_query(cb_id,"已推送新闻"); return
+
+        # —— 立即结算今日日榜奖励 —— #
+        if data == "ACT_AWARD_TODAY":
+            if not admin:
+                answer_callback_query(cb_id, "无权限", show_alert=True); return
+            day = tz_now().strftime("%Y-%m-%d")
+            guard_key = f"daily_award:{chat_id}:{day}"
+            if state_get(guard_key):
+                answer_callback_query(cb_id, "今天已结算过", show_alert=True); return
+
+            rows = list_top_day(chat_id, day, limit=TOP_REWARD_SIZE)
+            if not rows:
+                answer_callback_query(cb_id, "今日暂无发言数据", show_alert=True); return
+
+            bonus = DAILY_TOP_REWARD_START
+            lines = ["🏁 <b>今日日榜奖励已发放</b>"]
+            rank_idx = 1
+            for (uid2, un, fn, ln, c) in rows:
+                _upsert_user_base(chat_id, {"id": uid2, "username": un, "first_name": fn, "last_name": ln})
+                pts = max(bonus, 0)
+                if pts > 0:
+                    _add_points(chat_id, uid2, pts, uid, "top_day_reward_manual")
+                    name_link = rank_display_link(chat_id, uid2, un, fn, ln)
+                    lines.append(f"{rank_idx}. {name_link} +{pts} 分（今日 {c} 条）")
+                    rank_idx += 1
+                bonus -= 1
+
+            state_set(guard_key, "1")
+            send_message_html(chat_id, "\n".join(lines))
+            answer_callback_query(cb_id, "结算完成"); 
+            return
 
     except Exception:
         logger.exception("callback error")
@@ -1436,7 +1460,7 @@ def maybe_push_news():
         chats = NEWS_CHAT_IDS or gather_known_chats()
         for cid in chats:
             try: push_news_once(cid)
-            except Exception: logger.exception("news push error")
+            except Exception: logger.exception("news push error", extra={"chat_id": cid})
         state_set(key, (now+timedelta(minutes=INTERVAL_MINUTES)).isoformat())
 
 def maybe_daily_report():
@@ -1458,7 +1482,7 @@ def maybe_daily_report():
                     _add_points(cid, uid, max(bonus,0), uid, "top_day_reward")
                     bonus -= 1
         except Exception:
-            logger.exception("daily report error")
+            logger.exception("daily report error", extra={"chat_id": cid})
         state_set(rk, "1")
 
 def maybe_monthly_report():
@@ -1480,11 +1504,10 @@ def maybe_monthly_report():
                         _upsert_user_base(cid, {"id": uid, "username": un, "first_name": fn, "last_name": ln})
                         _add_points(cid, uid, reward, uid, "top_month_reward")
         except Exception:
-            logger.exception("monthly report error")
+            logger.exception("monthly report error", extra={"chat_id": cid})
         state_set(rk, "1")
 
 def maybe_daily_broadcast():
-    """23:59 日终播报：积分Top10 + 发言Top10 + 活跃人数（当日发过言的人数）"""
     h,m = parse_hhmm(DAILY_BROADCAST_AT); now = tz_now()
     if now.hour!=h or now.minute!=m: return
     day = now.strftime("%Y-%m-%d")
