@@ -440,17 +440,43 @@ def rank_display_name(chat_id: int, uid: int, un: str, fn: str, ln: str) -> str:
     return disp.strip() or f"ID:{uid}"
 
 def list_top_day(chat_id: int, day: str, limit: int = 10):
+    # 优先使用 scores 中的最新 username/first/last，保证显示 @username
     return _fetchall(
-        """SELECT user_id, MAX(username), MAX(first_name), MAX(last_name), SUM(cnt) AS c
-           FROM msg_counts WHERE chat_id=%s AND day=%s
-           GROUP BY user_id ORDER BY c DESC LIMIT %s""",
+        """
+        SELECT
+            mc.user_id,
+            COALESCE(NULLIF(s.username, ''), MAX(mc.username))       AS username,
+            COALESCE(NULLIF(s.first_name, ''), MAX(mc.first_name))   AS first_name,
+            COALESCE(NULLIF(s.last_name, ''),  MAX(mc.last_name))    AS last_name,
+            SUM(mc.cnt)                                              AS c
+        FROM msg_counts mc
+        LEFT JOIN scores s
+          ON s.chat_id = mc.chat_id AND s.user_id = mc.user_id
+        WHERE mc.chat_id = %s AND mc.day = %s
+        GROUP BY mc.user_id
+        ORDER BY c DESC
+        LIMIT %s
+        """,
         (chat_id, day, limit)
     )
 def list_top_month(chat_id: int, ym: str, limit: int = 10):
+    # 同上，月度聚合也优先取 scores 中的 username
     return _fetchall(
-        """SELECT user_id, MAX(username), MAX(first_name), MAX(last_name), SUM(cnt) AS c
-           FROM msg_counts WHERE chat_id=%s AND day LIKE CONCAT(%s,'-%')
-           GROUP BY user_id ORDER BY c DESC LIMIT %s""",
+        """
+        SELECT
+            mc.user_id,
+            COALESCE(NULLIF(s.username, ''), MAX(mc.username))       AS username,
+            COALESCE(NULLIF(s.first_name, ''), MAX(mc.first_name))   AS first_name,
+            COALESCE(NULLIF(s.last_name, ''),  MAX(mc.last_name))    AS last_name,
+            SUM(mc.cnt)                                              AS c
+        FROM msg_counts mc
+        LEFT JOIN scores s
+          ON s.chat_id = mc.chat_id AND s.user_id = mc.user_id
+        WHERE mc.chat_id = %s AND mc.day LIKE CONCAT(%s, '-%%')
+        GROUP BY mc.user_id
+        ORDER BY c DESC
+        LIMIT %s
+        """,
         (chat_id, ym, limit)
     )
 def list_score_top(chat_id: int, limit: int = 10):
