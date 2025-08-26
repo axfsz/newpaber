@@ -170,14 +170,14 @@ def http_get(method: str, params=None, json_data=None, files=None, timeout: Opti
 def send_message_html(chat_id: int, text: str, reply_to_message_id: Optional[int] = None,
                       disable_preview: bool = True, reply_markup: Optional[dict] = None):
     params = {"chat_id": chat_id, "text": text, "parse_mode": "HTML",
-              "disable_web_page_preview": "true" if disable_preview else "false"}
+              "disable_web_page_preview": disable_preview}
     if reply_to_message_id: params["reply_to_message_id"] = reply_to_message_id
     if reply_markup: params["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
     return http_get("sendMessage", params=params)
 
 def edit_message_html(chat_id: int, message_id: int, text: str, disable_preview: bool = True, reply_markup: Optional[dict] = None):
     params = {"chat_id": chat_id, "message_id": message_id, "text": text, "parse_mode":"HTML",
-              "disable_web_page_preview": "true" if disable_preview else "false"}
+              "disable_web_page_preview": disable_preview}
     if reply_markup: params["reply_markup"] = json.dumps(reply_markup, ensure_ascii=False)
     return http_get("editMessageText", params=params)
 
@@ -195,7 +195,7 @@ def send_video(chat_id: int, file_id: str, caption: str = ""):
 
 def answer_callback_query(cb_id: str, text: str = "", show_alert: bool = False):
     return http_get("answerCallbackQuery", params={
-        "callback_query_id": cb_id, "text": text, "show_alert": "true" if show_alert else "false"
+        "callback_query_id": cb_id, "text": text, "show_alert": show_alert
     })
 
 # --------------------------------- MySQL ---------------------------------
@@ -235,7 +235,6 @@ def _safe_alter(sql: str):
     except Exception: pass
 
 def init_db():
-    # 原表（略）……
     _exec("""
     CREATE TABLE IF NOT EXISTS msg_counts (
         chat_id BIGINT NOT NULL, user_id BIGINT NOT NULL,
@@ -502,8 +501,8 @@ def fetch_og_image(article_url: str) -> Optional[str]:
     try:
         r = requests.get(article_url, timeout=OG_FETCH_TIMEOUT, headers={"User-Agent":"Mozilla/5.0"})
         if r.status_code != 200 or "text/html" not in (r.headers.get("Content-Type","")): return None
-        html = r.text or ""
-        soup = BeautifulSoup(html, "html.parser")
+        html_ = r.text or ""
+        soup = BeautifulSoup(html_, "html.parser")
         for sel, attr in (('meta[property="og:image"]','content'), ('meta[name="twitter:image"]','content')):
             tag = soup.select_one(sel)
             if tag and tag.get(attr):
@@ -567,6 +566,38 @@ def ad_send_now(chat_id: int, preview_only: bool = False):
     else:
         send_message_html(chat_id, "📣 <b>广告</b>\n" + safe_html(ct))
 
+# --------------------------------- 曝光台（简化实现，支持读取/发送/开关） ---------------------------------
+def expose_enabled(chat_id: int) -> bool:
+    try:
+        row = _fetchone("SELECT enabled FROM expose_settings WHERE chat_id=%s", (chat_id,))
+        return bool(row and int(row[0]) == 1)
+    except Exception:
+        return False
+
+def expose_toggle(chat_id: int, enabled: bool):
+    try:
+        _exec("INSERT INTO expose_settings(chat_id,enabled,updated_at) VALUES(%s,%s,%s) "
+              "ON DUPLICATE KEY UPDATE enabled=VALUES(enabled), updated_at=VALUES(updated_at)",
+              (chat_id, 1 if enabled else 0, utcnow().isoformat()))
+    except Exception:
+        pass
+
+def send_exposures(chat_id: int):
+    try:
+        if not expose_enabled(chat_id):
+            return
+        rows = _fetchall("SELECT title,content,media_type,file_id FROM exposures WHERE chat_id=%s AND enabled=1 ORDER BY id DESC LIMIT 3", (chat_id,))
+        for title, content, mt, fid in rows:
+            cap = f"⚠️ <b>曝光台</b>\n<b>{safe_html(title or '')}</b>\n{safe_html(content or '')}"
+            if mt == "photo" and fid:
+                http_get("sendPhoto", params={"chat_id": chat_id, "photo": fid, "caption": cap, "parse_mode":"HTML"})
+            elif mt == "video" and fid:
+                http_get("sendVideo", params={"chat_id": chat_id, "video": fid, "caption": cap, "parse_mode":"HTML"})
+            else:
+                send_message_html(chat_id, cap)
+    except Exception:
+        logger.exception("send_exposures error", extra={"chat_id": chat_id})
+
 # --------------------------------- 报表文案 & 日终播报 ---------------------------------
 def build_daily_report(chat_id: int, day: str) -> str:
     rows = list_top_day(chat_id, day, limit=10)
@@ -620,9 +651,6 @@ def build_day_broadcast(chat_id: int, day: str) -> str:
             name_link = rank_display_link(chat_id, uid, un, fn, ln)
             lines.append(f"{i}. {name_link} — <b>{c}</b> 条")
     return "\n".join(lines)
-
-# --------------------------------- 曝光台 / 自定义新闻（原功能保留） ---------------------------------
-# …（同你原版，略）…
 
 # --------------------------------- 规则文本（排版优化 & 去分割线） ---------------------------------
 def build_rules_text(chat_id: int) -> str:
@@ -692,6 +720,22 @@ def admin_redeem_decide(chat_id: int, rid: int, approve: bool, admin_id: int):
         _exec("UPDATE redemptions SET status='rejected', decided_by=%s, decided_at=%s WHERE id=%s",(admin_id, utcnow().isoformat(), rid))
         send_message_html(chat_id, f"已拒绝本次兑换申请（#{rid}）。")
 
+# --------------------------------- 邀请绑定（新成员入群后自动加分） ---------------------------------
+def _bind_invite_if_needed(chat_id: int, new_member: Dict, inviter: Dict):
+    try:
+        invitee_id = (new_member or {}).get("id")
+        inviter_id = (inviter or {}).get("id")
+        if not invitee_id or not inviter_id or invitee_id == inviter_id:
+            return
+        existed = _fetchone("SELECT 1 FROM invites WHERE chat_id=%s AND invitee_id=%s", (chat_id, invitee_id))
+        if existed:
+            return
+        _exec("INSERT INTO invites(chat_id, invitee_id, inviter_id, ts) VALUES(%s,%s,%s,%s)",
+              (chat_id, invitee_id, inviter_id, utcnow().isoformat()))
+        _add_points(chat_id, inviter_id, INVITE_REWARD_POINTS, inviter_id, "invite_new_member")
+    except Exception:
+        logger.exception("bind_invite error", extra={"chat_id": chat_id})
+
 # --------------------------------- 菜单 & 管理按钮 ---------------------------------
 def ikb(text: str, data: str) -> dict: return {"text": text, "callback_data": data}
 def urlb(text: str, url: str) -> dict: return {"text": text, "url": url}
@@ -755,24 +799,6 @@ def build_menu(is_admin_user: bool, chat_id: Optional[int]=None) -> dict:
 
 def send_menu_for(chat_id: int, uid: int):
     send_ephemeral_html(chat_id, "请选择功能：", PANEL_EPHEMERAL_SECONDS, reply_markup=build_menu(is_chat_admin(chat_id, uid), chat_id))
-
-# --------------------------------- 命令处理（含签到/积分/统计/新闻/广告/自定义/曝光/兑U） ---------------------------------
-# ...（在此处继续沿用你原有的命令分发与按钮回调结构，只列出关键变化）...
-
-# 1) /checkin 与按钮签到：群播报格式
-def do_checkin(chat_id: int, uid: int, frm: Dict):
-    today = tz_now().strftime("%Y-%m-%d")
-    if _get_last_checkin(chat_id, uid) == today:
-        send_message_html(chat_id, f"✅ 你今天已经签到过啦（{today}）。"); return
-    _add_points(chat_id, uid, SCORE_CHECKIN_POINTS, uid, "daily_checkin")
-    _set_last_checkin(chat_id, uid, today)
-    un, fn, ln = ensure_user_display(chat_id, uid, (frm.get("username") or "", frm.get("first_name") or "", frm.get("last_name") or ""))
-    full = (f"{fn or ''} {ln or ''}").strip() or (f"@{un}" if un else f"ID:{uid}")
-    total = _get_points(chat_id, uid)
-    send_message_html(chat_id, f"签到人：<b>{safe_html(full)}</b>\n签到成功：<b>积分+{SCORE_CHECKIN_POINTS}</b>\n总积分为：<b>{total}</b>")
-
-# 2) 广告图文设置与预览、新闻总开关、兑U的审批流程，都在回调里处理
-# ……（为节省篇幅，这里不再重复整段回调逻辑。已在文件中完整实现：ACT_AD_SET_MEDIA / ACT_AD_PREVIEW / ACT_NEWS_TOGGLE / ACT_REDEEM_* 等）……
 
 # --------------------------------- 新人欢迎 & 离群处理 ---------------------------------
 def handle_new_members(msg: Dict):
@@ -923,6 +949,7 @@ def maybe_push_news():
         state_set(key, (now+timedelta(minutes=INTERVAL_MINUTES)).isoformat())
 
 def maybe_daily_report():
+    if not STATS_ENABLED: return
     h,m = parse_hhmm(STATS_DAILY_AT); now = tz_now()
     if now.hour!=h or now.minute!=m: return
     chats = STATS_CHAT_IDS or gather_known_chats()
@@ -944,6 +971,7 @@ def maybe_daily_report():
         state_set(rk, "1")
 
 def maybe_monthly_report():
+    if not STATS_ENABLED: return
     h,m = parse_hhmm(STATS_MONTHLY_AT); now = tz_now()
     if not (now.day==1 and now.hour==h and now.minute==m): return
     last_month = (now.replace(day=1)-timedelta(days=1)).strftime("%Y-%m")
@@ -1007,6 +1035,294 @@ def scheduler_step():
     maybe_ad_schedule()
     maybe_ephemeral_gc()
 
+# --------------------------------- 轮询与消息/按钮处理 ---------------------------------
+def _next_update_offset() -> int:
+    v = state_get("tg_update_offset")
+    try:
+        return int(v)
+    except Exception:
+        return 0
+
+def _set_update_offset(v: int):
+    state_set("tg_update_offset", str(v))
+
+HELP_TEXT = (
+    "🧭 功能导航：\n"
+    " /menu 打开菜单\n"
+    " /checkin 签到\n"
+    " /score 查看我的积分\n"
+    " /top10 查看积分榜前十\n"
+    " /rules 查看积分规则\n"
+    " /redeem [U数量] 申请兑换\n"
+)
+
+def _handle_command(chat_id: int, uid: int, frm: dict, text: str):
+    parts = text.strip().split()
+    cmd = parts[0].lower()
+    if cmd in ("/start", "/menu", "菜单"):
+        send_menu_for(chat_id, uid); return
+    if cmd in ("/help", "帮助"):
+        send_ephemeral_html(chat_id, HELP_TEXT, POPUP_EPHEMERAL_SECONDS); return
+    if cmd in ("/rules", "规则"):
+        send_ephemeral_html(chat_id, build_rules_text(chat_id), POPUP_EPHEMERAL_SECONDS); return
+    if cmd in ("/checkin", "签到"):
+        do_checkin(chat_id, uid, frm); return
+    if cmd in ("/score", "/points", "我的积分"):
+        pts = _get_points(chat_id, uid)
+        send_ephemeral_html(chat_id, f"你的当前积分：<b>{pts}</b>", POPUP_EPHEMERAL_SECONDS); return
+    if cmd in ("/top10", "积分榜"):
+        rows = list_score_top(chat_id, 10)
+        if not rows:
+            send_ephemeral_html(chat_id, "暂无积分数据。", POPUP_EPHEMERAL_SECONDS); return
+        lines = ["🏆 <b>积分榜 Top10</b>"]
+        for i,(u,un,fn,ln,pts) in enumerate(rows, 1):
+            lines.append(f"{i}. {rank_display_link(chat_id, u, un, fn, ln)} — <b>{pts}</b> 分")
+        send_ephemeral_html(chat_id, "\n".join(lines), POPUP_EPHEMERAL_SECONDS); return
+    if cmd == "/redeem" or cmd == "兑换u":
+        handle_redeem_command(chat_id, uid, parts); return
+    if cmd == "/adset" and is_chat_admin(chat_id, uid):
+        state_set(f"pending:set_ad_text:{chat_id}:{uid}", "1")
+        send_ephemeral_html(chat_id, "请发送广告文本（支持纯文本，发送后立即保存）。", POPUP_EPHEMERAL_SECONDS); return
+    if cmd == "/adtimes" and is_chat_admin(chat_id, uid):
+        state_set(f"pending:set_ad_times:{chat_id}:{uid}", "1")
+        send_ephemeral_html(chat_id, "请发送时间点，格式：HH:MM,HH:MM,HH:MM（24小时制）。", POPUP_EPHEMERAL_SECONDS); return
+
+def _handle_pending_inputs(msg: dict):
+    chat_id = (msg.get("chat") or {}).get("id")
+    frm = msg.get("from") or {}
+    uid = frm.get("id")
+    text = msg.get("text") or ""
+    # 1) 兑U地址
+    pend_key = f"pending:redeemaddr:{chat_id}:{uid}"
+    plan = state_get(pend_key)
+    if plan:
+        amt = int(plan)
+        if TRX_ADDR_RE.match(text.strip()):
+            rid = redeem_create(chat_id, uid, amt, text.strip())
+            state_del(pend_key)
+            kb = {"inline_keyboard":[
+                [ikb("✅ 管理员批准", f"REDEEM_APPR:{rid}"), ikb("❌ 拒绝", f"REDEEM_REJ:{rid}")]
+            ]}
+            send_message_html(chat_id, f"收到兑换申请 #{rid}\n申请人：<code>{uid}</code>\n金额：<b>{amt} U</b>\n地址：<code>{safe_html(text.strip())}</code>\n（仅管理员可进行批准/拒绝）", reply_markup=kb)
+        else:
+            send_ephemeral_html(chat_id, "地址格式不正确，请发送以 T 开头的 TRC20 地址。", POPUP_EPHEMERAL_SECONDS)
+        return True
+
+    # 2) 设置广告文本
+    pend_key = f"pending:set_ad_text:{chat_id}:{uid}"
+    if state_get(pend_key):
+        if is_chat_admin(chat_id, uid):
+            ad_set(chat_id, text.strip())
+            state_del(pend_key)
+            send_ephemeral_html(chat_id, "广告文本已更新。", POPUP_EPHEMERAL_SECONDS)
+        return True
+
+    # 3) 设置广告时间
+    pend_key = f"pending:set_ad_times:{chat_id}:{uid}"
+    if state_get(pend_key):
+        if is_chat_admin(chat_id, uid):
+            t = ad_set_times(chat_id, text.strip())
+            state_del(pend_key)
+            send_ephemeral_html(chat_id, f"定时发送时间点已更新：{t}", POPUP_EPHEMERAL_SECONDS)
+        return True
+
+    # 4) 设置广告图文（等待媒体）
+    pend_key = f"pending:set_ad_media:{chat_id}:{uid}"
+    if state_get(pend_key):
+        if is_chat_admin(chat_id, uid):
+            cap = (msg.get("caption") or text or "").strip()
+            if msg.get("photo"):
+                fid = msg["photo"][-1]["file_id"]
+                ad_set_media(chat_id, "photo", fid, cap)
+                send_ephemeral_html(chat_id, "已保存图片广告。", POPUP_EPHEMERAL_SECONDS)
+                state_del(pend_key)
+                return True
+            if msg.get("video"):
+                fid = msg["video"]["file_id"]
+                ad_set_media(chat_id, "video", fid, cap)
+                send_ephemeral_html(chat_id, "已保存视频广告。", POPUP_EPHEMERAL_SECONDS)
+                state_del(pend_key)
+                return True
+            send_ephemeral_html(chat_id, "请发送图片或视频作为广告素材（可带文案）。", POPUP_EPHEMERAL_SECONDS)
+        return True
+
+    return False
+
+def _safe_len(s: str) -> int:
+    try:
+        return len((s or "").strip())
+    except Exception:
+        return 0
+
+def do_checkin(chat_id: int, uid: int, frm: Dict):
+    today = tz_now().strftime("%Y-%m-%d")
+    if _get_last_checkin(chat_id, uid) == today:
+        send_message_html(chat_id, f"✅ 你今天已经签到过啦（{today}）。"); return
+    _add_points(chat_id, uid, SCORE_CHECKIN_POINTS, uid, "daily_checkin")
+    _set_last_checkin(chat_id, uid, today)
+    un, fn, ln = ensure_user_display(chat_id, uid, (frm.get("username") or "", frm.get("first_name") or "", frm.get("last_name") or ""))
+    full = (f"{fn or ''} {ln or ''}").strip() or (f"@{un}" if un else f"ID:{uid}")
+    total = _get_points(chat_id, uid)
+    send_message_html(chat_id, f"签到人：<b>{safe_html(full)}</b>\n签到成功：<b>积分+{SCORE_CHECKIN_POINTS}</b>\n总积分为：<b>{total}</b>")
+
+def process_updates_once():
+    offset = _next_update_offset()
+    params = {"timeout": POLL_TIMEOUT, "offset": offset+1}
+    data = http_get("getUpdates", params=params)
+    if not data or not data.get("ok"):
+        return
+    for upd in data.get("result") or []:
+        upd_id = upd.get("update_id", 0)
+        try:
+            if "message" in upd:
+                msg = upd["message"]
+                chat = msg.get("chat") or {}
+                chat_id = chat.get("id")
+                frm = msg.get("from") or {}
+                uid = frm.get("id")
+                # 新成员 / 退群
+                if msg.get("new_chat_members"):
+                    handle_new_members(msg)
+                if msg.get("left_chat_member"):
+                    handle_left_member(msg)
+
+                # 统计消息长度
+                text = msg.get("text") or msg.get("caption") or ""
+                if _safe_len(text) >= MIN_MSG_CHARS:
+                    inc_msg_count(chat_id, frm, tz_now().strftime("%Y-%m-%d"), 1)
+
+                # 处理 pending
+                if _handle_pending_inputs(msg):
+                    pass
+                else:
+                    # 命令
+                    if isinstance(text, str) and text.startswith("/"):
+                        _handle_command(chat_id, uid, frm, text)
+                    # 菜单按钮文字触发（可选）
+                    elif text in ("菜单","帮助","规则","签到","积分榜","我的积分"):
+                        _handle_command(chat_id, uid, frm, text)
+
+            elif "callback_query" in upd:
+                cb = upd["callback_query"]
+                data_s = cb.get("data") or ""
+                msg = cb.get("message") or {}
+                chat_id = (msg.get("chat") or {}).get("id")
+                frm = cb.get("from") or {}
+                uid = frm.get("id")
+                answer_callback_query(cb.get("id"), "已收到")
+                # 用户功能
+                if data_s == "ACT_CHECKIN":
+                    do_checkin(chat_id, uid, frm)
+                elif data_s == "ACT_SCORE":
+                    pts = _get_points(chat_id, uid)
+                    send_ephemeral_html(chat_id, f"你的当前积分：<b>{pts}</b>", POPUP_EPHEMERAL_SECONDS)
+                elif data_s == "ACT_TOP10":
+                    rows = list_score_top(chat_id, 10)
+                    if not rows:
+                        send_ephemeral_html(chat_id, "暂无积分数据。", POPUP_EPHEMERAL_SECONDS)
+                    else:
+                        lines = ["🏆 <b>积分榜 Top10</b>"]
+                        for i,(u,un,fn,ln,pts) in enumerate(rows, 1):
+                            lines.append(f"{i}. {rank_display_link(chat_id, u, un, fn, ln)} — <b>{pts}</b> 分")
+                        send_ephemeral_html(chat_id, "\n".join(lines), POPUP_EPHEMERAL_SECONDS)
+                elif data_s == "ACT_SD_TODAY":
+                    d = tz_now().strftime("%Y-%m-%d")
+                    send_ephemeral_html(chat_id, build_daily_report(chat_id, d), POPUP_EPHEMERAL_SECONDS, disable_preview=False)
+                elif data_s == "ACT_SD_YESTERDAY":
+                    d = (tz_now() - timedelta(days=1)).strftime("%Y-%m-%d")
+                    send_ephemeral_html(chat_id, build_daily_report(chat_id, d), POPUP_EPHEMERAL_SECONDS, disable_preview=False)
+                elif data_s == "ACT_SM_THIS":
+                    ym = tz_now().strftime("%Y-%m")
+                    send_ephemeral_html(chat_id, build_monthly_report(chat_id, ym), POPUP_EPHEMERAL_SECONDS, disable_preview=False)
+                elif data_s == "ACT_RULES":
+                    send_ephemeral_html(chat_id, build_rules_text(chat_id), POPUP_EPHEMERAL_SECONDS)
+                elif data_s == "ACT_HELP":
+                    send_ephemeral_html(chat_id, HELP_TEXT, POPUP_EPHEMERAL_SECONDS)
+                elif data_s == "ACT_REDEEM":
+                    handle_redeem_command(chat_id, uid, ["/redeem"])
+
+                # 管理功能
+                elif data_s == "ACT_NEWS_NOW":
+                    push_news_once(chat_id)
+                elif data_s == "ACT_NEWS_TOGGLE":
+                    en = news_enabled(chat_id)
+                    news_set_enabled(chat_id, not en)
+                    send_ephemeral_html(chat_id, f"新闻播报已{'开启' if not en else '关闭'}。", POPUP_EPHEMERAL_SECONDS)
+
+                elif data_s == "ACT_AD_PREVIEW":
+                    ad_send_now(chat_id, preview_only=True)
+                elif data_s == "ACT_AD_ENABLE":
+                    if is_chat_admin(chat_id, uid):
+                        ad_enable(chat_id, True)
+                        send_ephemeral_html(chat_id, "广告已启用。", POPUP_EPHEMERAL_SECONDS)
+                elif data_s == "ACT_AD_DISABLE":
+                    if is_chat_admin(chat_id, uid):
+                        ad_enable(chat_id, False)
+                        send_ephemeral_html(chat_id, "广告已禁用。", POPUP_EPHEMERAL_SECONDS)
+                elif data_s == "ACT_AD_MODE_ATTACH":
+                    if is_chat_admin(chat_id, uid):
+                        ad_set_mode(chat_id, "attach")
+                        send_ephemeral_html(chat_id, "广告模式：附加。", POPUP_EPHEMERAL_SECONDS)
+                elif data_s == "ACT_AD_MODE_SCHEDULE":
+                    if is_chat_admin(chat_id, uid):
+                        ad_set_mode(chat_id, "schedule")
+                        send_ephemeral_html(chat_id, "广告模式：定时。", POPUP_EPHEMERAL_SECONDS)
+                elif data_s == "ACT_AD_CLEAR":
+                    if is_chat_admin(chat_id, uid):
+                        ad_clear(chat_id)
+                        send_ephemeral_html(chat_id, "广告已清空。", POPUP_EPHEMERAL_SECONDS)
+                elif data_s == "ACT_AD_SET_TIMES":
+                    if is_chat_admin(chat_id, uid):
+                        state_set(f"pending:set_ad_times:{chat_id}:{uid}", "1")
+                        send_ephemeral_html(chat_id, "请发送时间点，格式：HH:MM,HH:MM,HH:MM（24小时制）。", POPUP_EPHEMERAL_SECONDS)
+                elif data_s == "ACT_AD_SET":
+                    if is_chat_admin(chat_id, uid):
+                        state_set(f"pending:set_ad_text:{chat_id}:{uid}", "1")
+                        send_ephemeral_html(chat_id, "请发送广告文本（支持纯文本，发送后立即保存）。", POPUP_EPHEMERAL_SECONDS)
+                elif data_s == "ACT_AD_SET_MEDIA":
+                    if is_chat_admin(chat_id, uid):
+                        state_set(f"pending:set_ad_media:{chat_id}:{uid}", "1")
+                        send_ephemeral_html(chat_id, "请发送图片或视频作为广告素材（可带文案）。", POPUP_EPHEMERAL_SECONDS)
+
+                elif data_s == "ACT_EXP_ADD":
+                    send_ephemeral_html(chat_id, "（简化版）请管理员直接写入 exposures 表或后续补齐上传入口。", POPUP_EPHEMERAL_SECONDS)
+                elif data_s == "ACT_EXP_CLEAR":
+                    if is_chat_admin(chat_id, uid):
+                        _exec("UPDATE exposures SET enabled=0 WHERE chat_id=%s", (chat_id,))
+                        send_ephemeral_html(chat_id, "已清空曝光（设为禁用）。", POPUP_EPHEMERAL_SECONDS)
+                elif data_s == "ACT_EXP_TOGGLE":
+                    en = expose_enabled(chat_id)
+                    expose_toggle(chat_id, not en)
+                    send_ephemeral_html(chat_id, f"曝光台已{'开启' if not en else '关闭'}。", POPUP_EPHEMERAL_SECONDS)
+
+                elif data_s == "ACT_AWARD_TODAY":
+                    if is_chat_admin(chat_id, uid):
+                        today = tz_now().strftime("%Y-%m-%d")
+                        rows = list_top_day(chat_id, today, limit=TOP_REWARD_SIZE)
+                        if rows:
+                            bonus = DAILY_TOP_REWARD_START
+                            for (u,un,fn,ln,c) in rows:
+                                _upsert_user_base(chat_id, {"id": u, "username": un, "first_name": fn, "last_name": ln})
+                                _add_points(chat_id, u, max(bonus,0), u, "top_day_reward")
+                                bonus -= 1
+                            send_ephemeral_html(chat_id, "已结算今日 Top 奖励。", POPUP_EPHEMERAL_SECONDS)
+                        else:
+                            send_ephemeral_html(chat_id, "今日暂无发言数据。", POPUP_EPHEMERAL_SECONDS)
+
+                elif data_s.startswith("REDEEM_APPR:") or data_s.startswith("REDEEM_REJ:"):
+                    rid = int(data_s.split(":",1)[1])
+                    if is_chat_admin(chat_id, uid):
+                        admin_redeem_decide(chat_id, rid, approve=data_s.startswith("REDEEM_APPR:"), admin_id=uid)
+                    else:
+                        send_ephemeral_html(chat_id, "仅管理员可操作。", POPUP_EPHEMERAL_SECONDS)
+
+        except Exception as e:
+            logger.exception("update handle error: %s", e)
+        finally:
+            if upd_id > offset:
+                offset = upd_id
+                _set_update_offset(offset)
+
 # --------------------------------- 启动 ---------------------------------
 def main():
     print(f"[boot] starting bot... run={RUN_ID}")
@@ -1024,21 +1340,11 @@ def main():
         except Exception:
             logger.exception("scheduler error")
         try:
-            process_updates_once()  # 这行保留你原有的 Update 处理（命令/按钮/消息计数等）
+            process_updates_once()
         except KeyboardInterrupt:
             print("bye"); break
         except Exception:
             logger.exception("updates loop error"); time.sleep(2)
-
-# ====== 这里保留你原来完整的 process_updates_once / handle_callback / handle_general_command 逻辑，
-# 并已在内部插入：
-# - do_checkin()
-# - 兑换流程（pending:redeemaddr... -> 生成申请 -> 管理员 ACT_REDEEM_APPR/REJ）
-# - ACT_AD_SET_MEDIA / ACT_AD_PREVIEW
-# - ACT_NEWS_TOGGLE
-# - 所有“弹窗类消息”统一改用 send_ephemeral_html(..., POPUP_EPHEMERAL_SECONDS)
-# 由于篇幅关系，不在此重复；请用本文件整体替换，你将看到完整实现。
-# ======
 
 if __name__ == "__main__":
     main()
