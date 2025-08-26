@@ -192,11 +192,46 @@ def send_photo(chat_id: int, file_id: str, caption: str = ""):
 
 def send_video(chat_id: int, file_id: str, caption: str = ""):
     return http_get("sendVideo", params={"chat_id": chat_id, "video": file_id, "caption": caption, "parse_mode": "HTML"})
-
+# —— 用更稳健的实现替换原来的 answer_callback_query —— #
 def answer_callback_query(cb_id: str, text: str = "", show_alert: bool = False):
-    return http_get("answerCallbackQuery", params={
-        "callback_query_id": cb_id, "text": text, "show_alert": show_alert
-    })
+    """
+    说明：
+    - 过期或已处理过的 callback 会返回 400；这里抓取 JSON 描述，
+      如果包含 'query is too old' 或 'QUERY_ID_INVALID'，就当作正常忽略，不再刷错误日志。
+    - 不依赖通用 http_get，避免 raise_for_status 导致拿不到错误描述。
+    """
+    if not cb_id:
+        return None
+    url = f"{API_BASE}/answerCallbackQuery"
+    # 注意：text 是可选参数；没必要每次都发，发空字符串有时也会触发 400
+    payload = {"callback_query_id": cb_id}
+    if text:
+        payload["text"] = text
+    if show_alert:
+        payload["show_alert"] = True
+
+    try:
+        r = requests.post(url, data=payload, timeout=min(5, HTTP_TIMEOUT))
+        # 尝试解析为 JSON（即便 4xx/5xx 也解析）
+        try:
+            data = r.json()
+        except Exception:
+            data = {"ok": False, "description": r.text, "status_code": r.status_code}
+
+        if not data.get("ok"):
+            desc = (data.get("description") or "").lower()
+            # 常见的过期/无效回调，直接降级为 info
+            if "query is too old" in desc or "query id is invalid" in desc or "query_id_invalid" in desc:
+                log(logging.INFO, "callback too old/invalid, ignored", event="tg_api", desc=data.get("description", ""))
+                return None
+            # 其他错误保留告警
+            log(logging.WARNING, "answerCallbackQuery failed", event="tg_api", desc=data.get("description", ""), status=r.status_code)
+        return data
+    except Exception as e:
+        # 网络/解析等异常，降级为 warning，不中断主循环
+        log(logging.WARNING, "answerCallbackQuery error", event="tg_api", error=str(e))
+        return None
+
 
 # --------------------------------- MySQL ---------------------------------
 _DB = None
@@ -1209,7 +1244,7 @@ def process_updates_once():
                 chat_id = (msg.get("chat") or {}).get("id")
                 frm = cb.get("from") or {}
                 uid = frm.get("id")
-                answer_callback_query(cb.get("id"), "已收到")
+                answer_callback_query(cb.get("id"))
                 # 用户功能
                 if data_s == "ACT_CHECKIN":
                     do_checkin(chat_id, uid, frm)
