@@ -877,17 +877,23 @@ def _next_update_offset()->int:
     try: return int(v)
     except Exception: return 0
 def _set_update_offset(v:int): state_set("tg_update_offset", str(v))
+def _handle_command(chat_id: int, uid: int, frm: dict, text: str, msg: Optional[dict] = None):
+    parts = text.strip().split()
+    cmd = parts[0].lower()
 
-def _handle_command(chat_id:int, uid:int, frm:dict, text:str):
-    parts=text.strip().split(); cmd=parts[0].lower()
-
+    # 退出/取消
     if cmd in ("/cancel","/stop","/exit","/esc") or parts[0] in ("取消","结束"):
-        clear_pending_states(chat_id, uid); send_ephemeral_html(chat_id,"已取消当前操作。", POPUP_EPHEMERAL_SECONDS); return
+        clear_pending_states(chat_id, uid)
+        send_ephemeral_html(chat_id, "已取消当前操作。", POPUP_EPHEMERAL_SECONDS)
+        return
+
+    # 打开菜单
     if cmd in ("/start","/menu") or parts[0] in ("菜单","导航"):
         clear_pending_states(chat_id, uid)
         send_menu_for(chat_id, uid)
         return
 
+    # 基本功能
     if cmd in ("/help", "帮助"):
         send_ephemeral_html(chat_id, HELP_TEXT, POPUP_EPHEMERAL_SECONDS); return
     if cmd in ("/rules", "规则"):
@@ -905,19 +911,21 @@ def _handle_command(chat_id:int, uid:int, frm:dict, text:str):
         for i,(u,un,fn,ln,pts) in enumerate(rows, 1):
             lines.append(f"{i}. {rank_display_link(chat_id, u, un, fn, ln)} — <b>{pts}</b> 分")
         send_ephemeral_html(chat_id, "\n".join(lines), POPUP_EPHEMERAL_SECONDS); return
+
+    # 兑换 U
     if cmd == "/redeem" or cmd == "兑换u":
-        # /redeem [U数量]
         pts = _get_points(chat_id, uid)
+        if pts < REDEEM_MIN_POINTS:
+            send_ephemeral_html(chat_id, f"当前积分 <b>{pts}</b>，未达兑换门槛（≥{REDEEM_MIN_POINTS}）。", POPUP_EPHEMERAL_SECONDS); return
         max_u = pts // REDEEM_RATE
         target_u = max_u
         if len(parts)>=2 and parts[1].isdigit():
             req_u = int(parts[1])
             if req_u > max_u:
-                send_ephemeral_html(chat_id, f"当前上限 <b>{max_u}</b> U，你积分不足以兑换 {req_u} U。", POPUP_EPHEMERAL_SECONDS); return
+                send_ephemeral_html(chat_id, f"可兑上限 <b>{max_u}</b> U，你不足以兑换 {req_u} U。", POPUP_EPHEMERAL_SECONDS); return
             target_u = req_u
         state_set(f"pending:redeemaddr:{chat_id}:{uid}", str(target_u))
-        kb = {"inline_keyboard":[[ikb("联系招商", "ACT_HELP")]]}
-        send_ephemeral_html(chat_id, f"请回复 <b>TRC20</b> 收款地址（以 <code>T</code> 开头）。\n本次计划兑换：<b>{target_u} U</b>", POPUP_EPHEMERAL_SECONDS, reply_markup=kb)
+        send_ephemeral_html(chat_id, f"请回复 <b>TRC20</b> 地址（以 <code>T</code> 开头）。本次计划兑换：<b>{target_u} U</b>", POPUP_EPHEMERAL_SECONDS)
         return
 
     # ==== 管理员命令：/score_add /score_sub ====
@@ -926,52 +934,44 @@ def _handle_command(chat_id:int, uid:int, frm:dict, text:str):
             send_ephemeral_html(chat_id, "仅管理员可使用积分管理。", POPUP_EPHEMERAL_SECONDS); return
         mode = "add" if cmd == "/score_add" else "sub"
 
-        # 如果是“回复某人”的消息：从命令里取数值
-        # 例：回复 A 的消息后发送 `/score_add 200`
-        try:
-            # 这里 msg 仅在 process_updates_once 中传入
-            msg = None
-            try:
-                # 从调用栈的上一层捕获（如果 process_updates_once 调用时传了 msg）
-                import inspect
-                prev_locals = inspect.currentframe().f_back.f_locals
-                msg = prev_locals.get("msg")
-            except Exception:
-                msg = None
+        # A) 如果是“回复某人”的消息：只需提供数值
+        if msg and msg.get("reply_to_message"):
+            m = re.search(r"([+-]?\d+)", text)
+            if not m:
+                send_ephemeral_html(chat_id, "请在命令后写上数值，例如：/score_add 200。", POPUP_EPHEMERAL_SECONDS); return
+            amt = int(m.group(1))
+            if mode == "sub" and amt > 0: amt = -amt
+            target = (msg["reply_to_message"].get("from") or {}).get("id")
+            if not target:
+                send_ephemeral_html(chat_id, "未识别到被回复的目标用户。", POPUP_EPHEMERAL_SECONDS); return
+            admin_adjust_points_by_uid(chat_id, uid, target, amt, f"admin_{mode}")
+            return
 
-            if msg and msg.get("reply_to_message"):
-                m = re.search(r"([+-]?\d+)", text)
-                if not m:
-                    send_ephemeral_html(chat_id, "请在命令后写上数值，例如：/score_add 200。", POPUP_EPHEMERAL_SECONDS); return
-                amt = int(m.group(1))
-                if mode == "sub" and amt > 0: amt = -amt
-                target = (msg["reply_to_message"].get("from") or {}).get("id")
-                if not target:
-                    send_ephemeral_html(chat_id, "未识别到被回复的目标用户。", POPUP_EPHEMERAL_SECONDS); return
-                admin_adjust_points_by_uid(chat_id, uid, target, amt, f"admin_{mode}")
-                return
-        except Exception:
-            pass
-
-        # 非回复场景：解析 “@用户名 数值”
+        # B) 非回复：解析“@用户名 数值”
         uname, amt = parse_username_and_amount(text)
         if not uname or amt is None:
-            send_ephemeral_html(chat_id, "用法：\n/score_add @username 200\n/score_sub @username 50\n或者先<b>回复</b>目标消息再发：/score_add 200", POPUP_EPHEMERAL_SECONDS); return
+            send_ephemeral_html(
+                chat_id,
+                "用法：\n/score_add @username 200\n/score_sub @username 50\n或先<b>回复</b>目标消息后发：/score_add 200",
+                POPUP_EPHEMERAL_SECONDS
+            ); 
+            return
         if mode == "sub" and amt > 0: amt = -amt
         admin_adjust_points(chat_id, uid, uname, amt, f"admin_{mode}")
         return
 
-    # 老的广告相关命令（兼容）
+    # 兼容旧广告命令
     if cmd == "/adset" and is_chat_admin(chat_id, uid):
         state_set(f"pending:set_ad_text:{chat_id}:{uid}", "1")
-        send_ephemeral_html(chat_id, "请发送广告文本（支持纯文本，发送后立即保存）。", POPUP_EPHEMERAL_SECONDS); return
+        send_ephemeral_html(chat_id, "请发送广告文本（发送后立即保存）。", POPUP_EPHEMERAL_SECONDS); return
     if cmd == "/adtimes" and is_chat_admin(chat_id, uid):
-        # 打开时间选择器
         try:
             ad_timepicker_open(chat_id, uid)
         except NameError:
             send_ephemeral_html(chat_id, "（时间选择器函数未引入，本命令暂不可用）", POPUP_EPHEMERAL_SECONDS)
         return
+
+    
 
 
 def _handle_pending_inputs(msg: dict) -> bool:
@@ -1104,7 +1104,8 @@ def process_updates_once():
                 else:
                     # 明确命令
                     if isinstance(text, str) and text.startswith("/"):
-                        _handle_command(chat_id, uid, frm, text, msg=msg)
+                       _handle_command(chat_id, uid, frm, text, msg=msg)
+
                     # 菜单文字触发
                     elif text in ("菜单","导航","帮助","规则","签到","积分榜","我的积分"):
                         _handle_command(chat_id, uid, frm, text, msg=msg)
@@ -1147,6 +1148,7 @@ def process_updates_once():
                     send_ephemeral_html(chat_id, HELP_TEXT, POPUP_EPHEMERAL_SECONDS)
                 elif data_s == "ACT_REDEEM":
                     _handle_command(chat_id, uid, frm, "/redeem", msg=None)
+
 
                 # —— 管理功能 —— #
                 elif data_s == "ACT_SCORE_MGR":
