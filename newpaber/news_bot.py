@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-Telegram 群机器人 - 新闻 / 统计 / 积分 / 广告 / 曝光台 / 自定义新闻 / 招商按钮 / 积分管理
+Telegram 群机器人 - 新闻 / 统计 / 积分 / 广告 / 曝光台 / 兑U / 新人欢迎 / 管理员积分管理 / 广告定时器
 """
 
 import os, re, sys, json, html, time, uuid, logging, requests, feedparser, pymysql
@@ -14,7 +14,7 @@ from typing import List, Tuple, Optional, Dict
 load_dotenv()
 BOT_TOKEN = (os.getenv("BOT_TOKEN") or os.getenv("TELEGRAM_BOT_TOKEN") or "").strip()
 if not BOT_TOKEN:
-    raise SystemExit("配置 BOT_TOKEN 到 .env")
+    raise SystemExit("配置 BOT_TOKEN 到 .env 中的 BOT_TOKEN")
 API_BASE = f"https://api.telegram.org/bot{BOT_TOKEN}"
 
 LOCAL_TZ_NAME = os.getenv("LOCAL_TZ", "Asia/Shanghai")
@@ -290,6 +290,7 @@ def state_del(key:str): _exec("DELETE FROM state WHERE `key`=%s",(key,))
 
 def clear_pending_states(chat_id:int, uid:int):
     for k in [
+        f"pending:redeemamount:{chat_id}:{uid}",   # 兑换数量
         f"pending:redeemaddr:{chat_id}:{uid}",
         f"pending:set_ad_text:{chat_id}:{uid}",
         f"pending:set_ad_times:{chat_id}:{uid}",
@@ -390,7 +391,7 @@ def fetch_og_image(article_url:str)->Optional[str]:
     except Exception: return None
     return None
 
-# ====================== 广告（略，保持你现有功能） ======================
+# ====================== 广告（存取 & 发送） ======================
 def ad_get(chat_id:int):
     row=_fetchone("SELECT enabled, content, COALESCE(mode,'attach'), COALESCE(times,''), COALESCE(media_type,'none'), COALESCE(file_id,'') FROM ads WHERE chat_id=%s",(chat_id,))
     if row:
@@ -440,9 +441,69 @@ def ad_send_now(chat_id:int, preview_only:bool=False):
     else:
         send_message_html(chat_id,"📣 <b>广告</b>\n"+safe_html(ct))
 
-# ======= 广告定时时间选择器（省略：保留你已有实现） =======
-# ...（保留你之前的时间选择器函数实现，不在此处重复粘贴，为节省篇幅）
-# >>> 注意：如果你直接覆盖文件，请保留上次我发给你的时间选择器函数们（_adtime_* 一整套）
+# ====== 广告定时：时间选择器（精简实现） ======
+def _adtime_state_key(chat_id:int, uid:int)->str:
+    return f"adtimebuilder:{chat_id}:{uid}"
+def _adtime_load(chat_id:int, uid:int)->dict:
+    raw = state_get(_adtime_state_key(chat_id, uid)) or "{}"
+    try: st = json.loads(raw)
+    except Exception: st = {}
+    st.setdefault("sel", []); st.setdefault("hpage", 0); st.setdefault("mpage", 0); st.setdefault("hold", None)
+    return st
+def _adtime_save(chat_id:int, uid:int, st:dict):
+    state_set(_adtime_state_key(chat_id, uid), json.dumps(st, ensure_ascii=False))
+def _adtime_txt(st:dict)->str:
+    sel = sorted(set(st.get("sel") or []))
+    pretty = ", ".join(sel) if sel else "<i>（空）</i>"
+    return ("🕒 <b>设置广告定时发送时间</b>\n"
+            "说明：先选“小时”，再选“分钟”即可添加一个时间点；可多选，完成后点“✅ 保存”。\n"
+            f"已选时间：{pretty}")
+def _adtime_kb(st:dict)->dict:
+    hpg = int(st.get("hpage") or 0); mpg = int(st.get("mpage") or 0)
+    hrs = list(range(0,12)) if hpg==0 else list(range(12,24))
+    hrow = [ikb(f"{h:02d}", f"AT_H:{h}") for h in hrs]
+    hpg_row = [ikb("0–11","AT_HPG:0"), ikb("12–23","AT_HPG:1")]
+    mins = [0,10,20,30,40,50] if mpg==0 else [5,15,25,35,45,55]
+    mrow = [ikb(f"{m:02d}", f"AT_M:{m}") for m in mins]
+    mpg_row = [ikb("00..50","AT_MPG:0"), ikb("05..55","AT_MPG:1")]
+    quick = [("➢09:00","09:00"),("➢12:00","12:00"),("➢18:00","18:00"),("➢21:00","21:00")]
+    qrow = [ikb(t, f"AT_Q:{v}") for t,v in quick]
+    act = [ikb("✅ 保存","AT_SAVE"), ikb("🧹 清空","AT_CLEAR"), ikb("❌ 关闭","AT_CLOSE")]
+    return {"inline_keyboard":[hrow, hpg_row, mrow, mpg_row, qrow, act]}
+def ad_timepicker_open(chat_id:int, uid:int):
+    if not is_chat_admin(chat_id, uid):
+        send_ephemeral_html(chat_id, "仅管理员可设置。", POPUP_EPHEMERAL_SECONDS); return
+    st=_adtime_load(chat_id, uid); _adtime_save(chat_id, uid, st)
+    send_ephemeral_html(chat_id, _adtime_txt(st), POPUP_EPHEMERAL_SECONDS, reply_markup=_adtime_kb(st))
+def ad_timepicker_handle(chat_id:int, uid:int, message_id:int, data_s:str, cb_id:str):
+    if not is_chat_admin(chat_id, uid): return
+    st=_adtime_load(chat_id, uid)
+    if data_s.startswith("AT_H:"):
+        h=int(data_s.split(":")[1]); st["hold"]=h
+    elif data_s.startswith("AT_M:"):
+        m=int(data_s.split(":")[1]); h=st.get("hold")
+        if h is not None:
+            st["sel"]=sorted(set((st.get("sel") or []) + [f"{int(h):02d}:{int(m):02d}"]))
+            st["hold"]=None
+    elif data_s.startswith("AT_Q:"):
+        v=data_s.split(":",1)[1]
+        st["sel"]=sorted(set((st.get("sel") or []) + [v])); st["hold"]=None
+    elif data_s.startswith("AT_HPG:"):
+        st["hpage"]=int(data_s.split(":")[1])%2
+    elif data_s.startswith("AT_MPG:"):
+        st["mpage"]=int(data_s.split(":")[1])%2
+    elif data_s=="AT_CLEAR":
+        st["sel"]=[]; st["hold"]=None
+    elif data_s=="AT_SAVE":
+        times=",".join(st.get("sel") or [])
+        ad_set_times(chat_id, times)
+        state_del(_adtime_state_key(chat_id, uid))
+        edit_message_html(chat_id, message_id, f"🕒 已保存广告发送时间：\n<b>{safe_html(times or '（空）')}</b>")
+        return
+    elif data_s=="AT_CLOSE":
+        state_del(_adtime_state_key(chat_id, uid)); edit_message_html(chat_id, message_id, "已关闭设置。"); return
+    _adtime_save(chat_id, uid, st)
+    edit_message_html(chat_id, message_id, _adtime_txt(st), reply_markup=_adtime_kb(st))
 
 # ====================== 报表/规则文案 ======================
 _KEYCAP=["","1️⃣","2️⃣","3️⃣","4️⃣","5️⃣","6️⃣","7️⃣","8️⃣","9️⃣","🔟"]
@@ -478,7 +539,7 @@ def build_rules_text(chat_id:int)->str:
     lines.append("• 贴纸及表情包不统计")
     return "\n".join(lines)
 
-# ====================== 兑换 U（略，保留你已有实现） ======================
+# ====================== 兑换 U ======================
 TRX_ADDR_RE=re.compile(r"^T[1-9A-HJ-NP-Za-km-z]{33}$")
 def redeem_create(chat_id:int, uid:int, u_amount:int, addr:str):
     row=_fetchone("SELECT username,first_name,last_name,points FROM scores WHERE chat_id=%s AND user_id=%s",(chat_id,uid))
@@ -491,12 +552,8 @@ def redeem_broadcast_success(chat_id:int, uid:int, u_amount:int):
     un,fn,ln=ensure_user_display(chat_id, uid, ("","",""))
     full=(f"{fn or ''} {ln or ''}").strip() or (f"@{un}" if un else f"ID:{uid}")
     send_message_html(chat_id, f"🎉 恭喜“{safe_html(full)}”兑换成功\n兑换金额：<b>{u_amount} U</b>")
+
 def admin_redeem_decide(chat_id: int, rid: int, approve: bool, admin_id: int):
-    """
-    管理员审批/拒绝兑换申请：
-    - approve=True  扣除所需积分（最多扣到 0），标记为 approved，并群内通知
-    - approve=False 不扣分，标记为 rejected，并群内通知
-    """
     row = _fetchone(
         "SELECT id, user_id, u_amount, status FROM redemptions WHERE id=%s AND chat_id=%s",
         (rid, chat_id),
@@ -504,31 +561,26 @@ def admin_redeem_decide(chat_id: int, rid: int, approve: bool, admin_id: int):
     if not row:
         send_ephemeral_html(chat_id, f"未找到兑换申请 #{rid}", POPUP_EPHEMERAL_SECONDS)
         return
-
     _, user_id, u_amount, status = row
     status = (status or "").lower()
     if status != "pending":
         send_ephemeral_html(chat_id, f"兑换申请 #{rid} 已处理（{status}）。", POPUP_EPHEMERAL_SECONDS)
         return
-
     if approve:
         need_pts = int(u_amount) * REDEEM_RATE
         cur_pts = _get_points(chat_id, int(user_id))
-        deduct = min(cur_pts, need_pts)  # 防止出现负分
+        deduct = min(cur_pts, need_pts)
         if deduct > 0:
             _add_points(chat_id, int(user_id), -deduct, int(admin_id), "redeem_approve")
         _exec(
             "UPDATE redemptions SET status='approved', decided_by=%s, decided_at=%s WHERE id=%s",
             (admin_id, utcnow().isoformat(), rid),
         )
-        # 公告 & 回执
         redeem_broadcast_success(chat_id, int(user_id), int(u_amount))
         new_pts = _get_points(chat_id, int(user_id))
         send_message_html(
             chat_id,
-            f"✅ 兑换申请 #{rid} 已批准\n"
-            f"扣除积分：<b>{deduct}</b>（需求 {need_pts}）\n"
-            f"当前余额：<b>{new_pts}</b>",
+            f"✅ 兑换申请 #{rid} 已批准\n扣除积分：<b>{deduct}</b>（需求 {need_pts}）\n当前余额：<b>{new_pts}</b>",
         )
     else:
         _exec(
@@ -536,7 +588,6 @@ def admin_redeem_decide(chat_id: int, rid: int, approve: bool, admin_id: int):
             (admin_id, utcnow().isoformat(), rid),
         )
         send_message_html(chat_id, f"❌ 兑换申请 #{rid} 已拒绝。")
-
 
 # ====================== 邀请绑定/新人欢迎 ======================
 def _bind_invite_if_needed(chat_id:int, new_member:Dict, inviter:Dict):
@@ -556,7 +607,7 @@ def handle_new_members(msg:Dict):
         if inviter and inviter.get("id") and inviter.get("id")!=(m or {}).get("id"):
             _bind_invite_if_needed(chat_id, m, inviter)
     if WELCOME_PANEL_ENABLED and members:
-        send_ephemeral_html(chat_id, build_rules_text(chat_id), WELCOME_EPHEMERAL_SECONDS, reply_markup=build_menu(False, chat_id))
+        send_ephemeral_html(chat_id, build_rules_text(chat_id), WELCOME_EPHEMERAL_SECONDS, reply_markup=build_menu(is_admin_user=False, chat_id=chat_id))
 
 def handle_left_member(msg:Dict):
     chat_id=(msg.get("chat") or {}).get("id"); left=msg.get("left_chat_member") or {}
@@ -598,20 +649,23 @@ def build_menu(is_admin_user:bool, chat_id:Optional[int]=None)->dict:
     kb=[
         [ikb("✅ 签到","ACT_CHECKIN")],
         [ikb("📌 我的积分","ACT_SCORE"), ikb("🏆 积分榜Top10","ACT_TOP10")],
-        [ikb("📊 今日发言统计","ACT_SD_TODAY"), ikb("📊 本月发言统计","ACT_SM_THIS")],
-        [ikb("📜 积分规则","ACT_RULES")],
-        [ikb("🎁 积分兑U","ACT_REDEEM")],
+        [ikb("📊 今日发言排名","ACT_SD_TODAY"), ikb("📊 本月发言排名","ACT_SM_THIS")],
+        [ikb("📜 规则","ACT_RULES")],
+        [ikb("💱 积分兑U","ACT_REDEEM")],
         [ikb("🆘 帮助","ACT_HELP")],
     ]
+    # 管理专属
     if chat_id is not None and is_admin_user:
-        kb.append([ikb("🛠 积分管理","ACT_SCORE_MGR")])  # <<< 新增
-        kb.append([ikb("📰 自定义新闻","ACT_CNEWS_PANEL")])
+        kb.append([ikb("🛠 积分管理","ACT_SCORE_MGR")])
+        # 如需开放自定义新闻，可在回调里处理 ACT_CNEWS_PANEL
+        # kb.append([ikb("📰 自定义新闻","ACT_CNEWS_PANEL")])
         kb.append([ikb("📣 广告显示","ACT_AD_SHOW"), ikb("🟢 启用广告","ACT_AD_ENABLE"), ikb("🔴 禁用广告","ACT_AD_DISABLE")])
         kb.append([ikb("📎 设为附加模式","ACT_AD_MODE_ATTACH"), ikb("⏰ 设为定时模式","ACT_AD_MODE_SCHEDULE")])
         kb.append([ikb("🕒 设置时间点","ACT_AD_SET_TIMES"), ikb("🖼 设置图文广告","ACT_AD_SET_MEDIA"), ikb("🔍 预览广告","ACT_AD_PREVIEW")])
         kb.append([ikb("🧹 清空广告","ACT_AD_CLEAR"), ikb("✍️ 设置广告文本","ACT_AD_SET")])
         kb.append([ikb("🗞 立即推送新闻","ACT_NEWS_NOW"),
                    ikb(("🔴 关闭新闻播报" if news_enabled(chat_id) else "🟢 开启新闻播报"), "ACT_NEWS_TOGGLE")])
+    # 招商按钮：所有用户可见（本次需求）
     biz_btns=get_biz_buttons()
     if biz_btns:
         row=[]
@@ -624,7 +678,7 @@ def build_menu(is_admin_user:bool, chat_id:Optional[int]=None)->dict:
 def send_menu_for(chat_id:int, uid:int):
     send_ephemeral_html(chat_id, "请选择功能：", PANEL_EPHEMERAL_SECONDS, reply_markup=build_menu(is_chat_admin(chat_id, uid), chat_id))
 
-# ====================== 报表（略，与上一版一致） ======================
+# ====================== 报表（查询/拼文案） ======================
 def list_top_day(chat_id:int, day:str, limit:int=10):
     return _fetchall("""
         SELECT
@@ -673,11 +727,11 @@ def _zh(s:str)->str:
     try: return _gt.translate(s)
     except Exception: return s
 
-# ====================== 新闻（略，保留上一版 push_news_once 等函数） ======================
+# ====================== 新闻抓取/推送 ======================
 CATEGORY_MAP={
     "finance":("财经",["https://www.reuters.com/finance/rss"]),
     "sea":("东南亚",["https://www.straitstimes.com/news/world/asia/rss.xml"]),
-    "war":("战争",["https://feeds.bbci.co.uk/news/world/rss.xml"]),
+    "war":("国际",["https://feeds.bbci.co.uk/news/world/rss.xml"]),
 }
 def fetch_rss_list(urls:List[str], max_items:int)->List[Dict]:
     items=[]
@@ -722,7 +776,7 @@ def push_news_once(chat_id:int):
         sent=True
     if not sent: send_message_html(chat_id,"🗞️ 暂无可用新闻。")
 
-# ====================== 调度（略，与上一版一致） ======================
+# ====================== 调度 ======================
 def gather_known_chats()->List[int]:
     chats=set(NEWS_CHAT_IDS or [])
     for r in _fetchall("SELECT DISTINCT chat_id FROM msg_counts",()): chats.add(int(r[0]))
@@ -796,7 +850,7 @@ def maybe_ephemeral_gc_wrap():
 def scheduler_step():
     maybe_push_news(); maybe_daily_report(); maybe_monthly_report(); maybe_daily_broadcast(); maybe_ephemeral_gc_wrap()
 
-# ====================== 报表文本函数（复用） ======================
+# ====================== 报表文本函数 ======================
 def build_daily_report(chat_id:int, day:str)->str:
     rows=list_top_day(chat_id, day, limit=10)
     total=_fetchone("SELECT SUM(cnt) FROM msg_counts WHERE chat_id=%s AND day=%s",(chat_id,day))[0] or 0
@@ -836,10 +890,8 @@ def build_day_broadcast(chat_id:int, day:str)->str:
 def find_user_by_username(chat_id:int, username:str)->Optional[Tuple[int,str,str,str]]:
     uname=(username or "").lstrip("@").strip()
     if not uname: return None
-    # 先在 scores 表查
     row=_fetchone("SELECT user_id, username, first_name, last_name FROM scores WHERE chat_id=%s AND LOWER(username)=LOWER(%s) LIMIT 1",(chat_id, uname))
     if row: return (int(row[0]), row[1] or "", row[2] or "", row[3] or "")
-    # 再在 msg_counts 最近记录里查
     row=_fetchone("""SELECT mc.user_id, mc.username, mc.first_name, mc.last_name 
                      FROM msg_counts mc 
                      WHERE mc.chat_id=%s AND LOWER(mc.username)=LOWER(%s) 
@@ -869,7 +921,6 @@ def admin_adjust_points(chat_id:int, admin_id:int, username:str, delta:int, reas
     send_message_html(chat_id, f"🛠 管理员已调整积分：\n目标：{name_link}\n变动：<b>{sign}{delta}</b>\n当前：<b>{after}</b>", disable_preview=True)
 
 def parse_username_and_amount(text:str)->Tuple[Optional[str], Optional[int]]:
-    # 支持：@name 200 / name 200 / @name +200 / @name -50
     m=re.search(r"(?:^|\s)@?([A-Za-z0-9_]{5,32})\s+([+-]?\d+)(?:\s|$)", text.strip())
     if not m: return None, None
     return m.group(1), int(m.group(2))
@@ -894,6 +945,33 @@ def open_score_mgr(chat_id:int, uid:int):
         reply_markup=build_score_mgr_kb()
     )
 
+# ====================== 解析兑换数量（U 或 积分） ======================
+def parse_redeem_amount_input(text:str, current_points:int)->Tuple[Optional[int], Optional[str]]:
+    text = (text or "").strip()
+    if not text:
+        return None, "请输入要兑换的数量，例如 50U 或 10000分"
+    if text.lower() in ("all","max","最大","全部"):
+        max_u = current_points // REDEEM_RATE
+        return (max_u if max_u>=1 else None), (None if max_u>=1 else "当前积分不足以兑换 1U")
+    m = re.match(r"^\s*(\d+)\s*([uU]|分|积分|点|points?|pts?)?\s*$", text)
+    if not m:
+        return None, "格式不正确。示例：50U 或 10000分"
+    n = int(m.group(1)); unit = (m.group(2) or "").lower()
+    max_u = current_points // REDEEM_RATE
+    if unit in ("分","积分","点","point","points","pt","pts"):
+        if n > current_points:
+            return None, "兑换积分超过你的当前积分"
+        u = n // REDEEM_RATE
+        if u < 1:
+            return None, f"至少满 {REDEEM_RATE} 积分才能兑换 1U"
+        return u, None
+    u = n
+    if u < 1:
+        return None, "兑换数量需 ≥ 1U"
+    if u > max_u:
+        return None, f"可兑上限 {max_u}U，超出当前积分可兑换额度"
+    return u, None
+
 # ====================== 命令 ======================
 HELP_TEXT=(
     "🧭 功能导航：\n"
@@ -902,7 +980,7 @@ HELP_TEXT=(
     " /score 查看我的积分\n"
     " /top10 查看积分榜前十\n"
     " /rules 查看积分规则\n"
-    " /redeem [U数量] 申请兑换\n"
+    " /redeem 发起兑换流程（输入 50U 或 10000分）\n"
     " /cancel 取消当前操作\n\n"
     "管理员：/score_add @username 200 、 /score_sub @username 50（也可回复消息）"
 )
@@ -923,23 +1001,16 @@ def _next_update_offset()->int:
     try: return int(v)
     except Exception: return 0
 def _set_update_offset(v:int): state_set("tg_update_offset", str(v))
+
 def _handle_command(chat_id: int, uid: int, frm: dict, text: str, msg: Optional[dict] = None):
-    parts = text.strip().split()
-    cmd = parts[0].lower()
+    parts=text.strip().split(); cmd=parts[0].lower()
 
-    # 退出/取消
     if cmd in ("/cancel","/stop","/exit","/esc") or parts[0] in ("取消","结束"):
-        clear_pending_states(chat_id, uid)
-        send_ephemeral_html(chat_id, "已取消当前操作。", POPUP_EPHEMERAL_SECONDS)
-        return
+        clear_pending_states(chat_id, uid); send_ephemeral_html(chat_id,"已取消当前操作。", POPUP_EPHEMERAL_SECONDS); return
 
-    # 打开菜单
     if cmd in ("/start","/menu") or parts[0] in ("菜单","导航"):
-        clear_pending_states(chat_id, uid)
-        send_menu_for(chat_id, uid)
-        return
+        clear_pending_states(chat_id, uid); send_menu_for(chat_id, uid); return
 
-    # 基本功能
     if cmd in ("/help", "帮助"):
         send_ephemeral_html(chat_id, HELP_TEXT, POPUP_EPHEMERAL_SECONDS); return
     if cmd in ("/rules", "规则"):
@@ -958,29 +1029,34 @@ def _handle_command(chat_id: int, uid: int, frm: dict, text: str, msg: Optional[
             lines.append(f"{i}. {rank_display_link(chat_id, u, un, fn, ln)} — <b>{pts}</b> 分")
         send_ephemeral_html(chat_id, "\n".join(lines), POPUP_EPHEMERAL_SECONDS); return
 
-    # 兑换 U
-    if cmd == "/redeem" or cmd == "兑换u":
+    # 兑换 U（先收数量，再收地址；也支持 /redeem 50U 直接跳过收数量）
+    if cmd == "/redeem" or cmd == "兑换u" or cmd == "积分兑u":
         pts = _get_points(chat_id, uid)
         if pts < REDEEM_MIN_POINTS:
             send_ephemeral_html(chat_id, f"当前积分 <b>{pts}</b>，未达兑换门槛（≥{REDEEM_MIN_POINTS}）。", POPUP_EPHEMERAL_SECONDS); return
+        if len(parts) >= 2:
+            u_amount, err = parse_redeem_amount_input("".join(parts[1:]), pts)
+            if err:
+                send_ephemeral_html(chat_id, err, POPUP_EPHEMERAL_SECONDS); return
+            state_set(f"pending:redeemaddr:{chat_id}:{uid}", str(u_amount))
+            send_ephemeral_html(chat_id, f"请回复 <b>TRC20</b> 收款地址（以 <code>T</code> 开头）。\n本次计划兑换：<b>{u_amount} U</b>", POPUP_EPHEMERAL_SECONDS)
+            return
+        state_set(f"pending:redeemamount:{chat_id}:{uid}", "1")
         max_u = pts // REDEEM_RATE
-        target_u = max_u
-        if len(parts)>=2 and parts[1].isdigit():
-            req_u = int(parts[1])
-            if req_u > max_u:
-                send_ephemeral_html(chat_id, f"可兑上限 <b>{max_u}</b> U，你不足以兑换 {req_u} U。", POPUP_EPHEMERAL_SECONDS); return
-            target_u = req_u
-        state_set(f"pending:redeemaddr:{chat_id}:{uid}", str(target_u))
-        send_ephemeral_html(chat_id, f"请回复 <b>TRC20</b> 地址（以 <code>T</code> 开头）。本次计划兑换：<b>{target_u} U</b>", POPUP_EPHEMERAL_SECONDS)
-        return
+        send_ephemeral_html(
+            chat_id,
+            "请输入要兑换的数量：\n"
+            "• 例：<code>50U</code>（按U）或 <code>10000分</code>（按积分）。\n"
+            "• 也可发送 <code>最大</code>/<code>all</code>/<code>max</code> 兑换可兑上限。\n"
+            f"当前积分：<b>{pts}</b>（可兑上限：<b>{max_u}</b>U）",
+            POPUP_EPHEMERAL_SECONDS
+        ); return
 
-    # ==== 管理员命令：/score_add /score_sub ====
+    # 管理员命令：/score_add /score_sub
     if cmd in ("/score_add", "/score_sub"):
         if not is_chat_admin(chat_id, uid):
             send_ephemeral_html(chat_id, "仅管理员可使用积分管理。", POPUP_EPHEMERAL_SECONDS); return
         mode = "add" if cmd == "/score_add" else "sub"
-
-        # A) 如果是“回复某人”的消息：只需提供数值
         if msg and msg.get("reply_to_message"):
             m = re.search(r"([+-]?\d+)", text)
             if not m:
@@ -992,48 +1068,43 @@ def _handle_command(chat_id: int, uid: int, frm: dict, text: str, msg: Optional[
                 send_ephemeral_html(chat_id, "未识别到被回复的目标用户。", POPUP_EPHEMERAL_SECONDS); return
             admin_adjust_points_by_uid(chat_id, uid, target, amt, f"admin_{mode}")
             return
-
-        # B) 非回复：解析“@用户名 数值”
         uname, amt = parse_username_and_amount(text)
         if not uname or amt is None:
-            send_ephemeral_html(
-                chat_id,
-                "用法：\n/score_add @username 200\n/score_sub @username 50\n或先<b>回复</b>目标消息后发：/score_add 200",
-                POPUP_EPHEMERAL_SECONDS
-            ); 
-            return
+            send_ephemeral_html(chat_id, "用法：\n/score_add @username 200\n/score_sub @username 50\n或先<b>回复</b>目标消息后发：/score_add 200", POPUP_EPHEMERAL_SECONDS); return
         if mode == "sub" and amt > 0: amt = -amt
-        admin_adjust_points(chat_id, uid, uname, amt, f"admin_{mode}")
-        return
+        admin_adjust_points(chat_id, uid, uname, amt, f"admin_{mode}"); return
 
-    # 兼容旧广告命令
     if cmd == "/adset" and is_chat_admin(chat_id, uid):
         state_set(f"pending:set_ad_text:{chat_id}:{uid}", "1")
         send_ephemeral_html(chat_id, "请发送广告文本（发送后立即保存）。", POPUP_EPHEMERAL_SECONDS); return
     if cmd == "/adtimes" and is_chat_admin(chat_id, uid):
-        try:
-            ad_timepicker_open(chat_id, uid)
-        except NameError:
-            send_ephemeral_html(chat_id, "（时间选择器函数未引入，本命令暂不可用）", POPUP_EPHEMERAL_SECONDS)
-        return
-
-    
-
+        ad_timepicker_open(chat_id, uid); return
 
 def _handle_pending_inputs(msg: dict) -> bool:
-    """返回 True 表示该消息已在此处消费"""
     chat_id = (msg.get("chat") or {}).get("id")
     frm = msg.get("from") or {}
     uid = frm.get("id")
     text = (msg.get("text") or "").strip()
 
-    # 允许这些词在任何 pending 下直接穿透（交给 _handle_command）
     if text and (text.startswith("/") or text in ("菜单","导航","帮助","规则","签到","积分榜","我的积分")):
         if text.lower() in ("/cancel","/stop","/exit","/esc") or text in ("取消","结束"):
             clear_pending_states(chat_id, uid)
             send_ephemeral_html(chat_id, "已取消当前操作。", POPUP_EPHEMERAL_SECONDS)
             return True
         return False
+
+    # 0) 兑U数量
+    pend_amount_key = f"pending:redeemamount:{chat_id}:{uid}"
+    if state_get(pend_amount_key):
+        pts = _get_points(chat_id, uid)
+        u_amount, err = parse_redeem_amount_input(text, pts)
+        if err:
+            send_ephemeral_html(chat_id, err + "（/cancel 退出）", POPUP_EPHEMERAL_SECONDS)
+            return True
+        state_del(pend_amount_key)
+        state_set(f"pending:redeemaddr:{chat_id}:{uid}", str(u_amount))
+        send_ephemeral_html(chat_id, f"请回复 <b>TRC20</b> 收款地址（以 <code>T</code> 开头）。\n本次计划兑换：<b>{u_amount} U</b>", POPUP_EPHEMERAL_SECONDS)
+        return True
 
     # 1) 兑U地址
     pend_key = f"pending:redeemaddr:{chat_id}:{uid}"
@@ -1087,12 +1158,10 @@ def _handle_pending_inputs(msg: dict) -> bool:
             send_ephemeral_html(chat_id, "请发送图片或视频作为广告素材（可带文案），或发送 /cancel 退出。", POPUP_EPHEMERAL_SECONDS)
         return True
 
-    # 5) 积分管理“模式等待”：
-    #    pending:score:mode:{chat_id}:{uid} = 'add' | 'sub'
+    # 5) 积分管理“模式等待”
     pend_key = f"pending:score:mode:{chat_id}:{uid}"
     mode = state_get(pend_key)
     if mode:
-        # 先看是不是“回复某人”的消息，只要发一个数字就行
         if msg.get("reply_to_message"):
             m = re.search(r"([+-]?\d+)", text)
             if m:
@@ -1103,21 +1172,16 @@ def _handle_pending_inputs(msg: dict) -> bool:
                     admin_adjust_points_by_uid(chat_id, uid, target, amt, f"admin_{mode}")
                     state_del(pend_key)
                     return True
-
-        # 非回复：解析“@用户名 数值”
         uname, amt = parse_username_and_amount(text)
         if uname and amt is not None:
             if mode == "sub" and amt > 0: amt = -amt
             admin_adjust_points(chat_id, uid, uname, amt, f"admin_{mode}")
             state_del(pend_key)
             return True
-
-        # 还没有解析成功——提示格式
         send_ephemeral_html(chat_id, "格式：@用户名 数值；或先<b>回复</b>目标消息再仅发送“数值”。（/cancel 退出）", POPUP_EPHEMERAL_SECONDS)
         return True
 
     return False
-
 
 def process_updates_once():
     offset = _next_update_offset()
@@ -1135,24 +1199,18 @@ def process_updates_once():
                 frm = msg.get("from") or {}
                 uid = frm.get("id")
 
-                # 新人 / 退群
                 if msg.get("new_chat_members"): handle_new_members(msg)
                 if msg.get("left_chat_member"): handle_left_member(msg)
 
-                # 统计消息长度
                 text = msg.get("text") or msg.get("caption") or ""
                 if isinstance(text, str) and len(text.strip()) >= MIN_MSG_CHARS:
                     inc_msg_count(chat_id, frm, tz_now().strftime("%Y-%m-%d"), 1)
 
-                # 先处理 pending
                 if _handle_pending_inputs(msg):
                     pass
                 else:
-                    # 明确命令
                     if isinstance(text, str) and text.startswith("/"):
-                       _handle_command(chat_id, uid, frm, text, msg=msg)
-
-                    # 菜单文字触发
+                        _handle_command(chat_id, uid, frm, text, msg=msg)
                     elif text in ("菜单","导航","帮助","规则","签到","积分榜","我的积分"):
                         _handle_command(chat_id, uid, frm, text, msg=msg)
 
@@ -1164,10 +1222,8 @@ def process_updates_once():
                 frm = cb.get("from") or {}
                 uid = frm.get("id")
 
-                # 立刻回 ACK，避免回调过期报错
                 answer_callback_query(cb.get("id"))
 
-                # 普通用户功能
                 if data_s == "ACT_CHECKIN":
                     do_checkin(chat_id, uid, frm)
                 elif data_s == "ACT_SCORE":
@@ -1195,8 +1251,7 @@ def process_updates_once():
                 elif data_s == "ACT_REDEEM":
                     _handle_command(chat_id, uid, frm, "/redeem", msg=None)
 
-
-                # —— 管理功能 —— #
+                # 管理功能
                 elif data_s == "ACT_SCORE_MGR":
                     open_score_mgr(chat_id, uid)
                 elif data_s == "ACT_SCORE_ADD":
@@ -1227,7 +1282,6 @@ def process_updates_once():
                         f"文本：{('有' if ct.strip() else '空')}"
                     ]
                     send_ephemeral_html(chat_id, "📣 <b>广告概览</b>\n" + "\n".join(info), POPUP_EPHEMERAL_SECONDS)
-
                 elif data_s == "ACT_AD_PREVIEW":
                     ad_send_now(chat_id, preview_only=True)
                 elif data_s == "ACT_AD_ENABLE":
@@ -1247,10 +1301,7 @@ def process_updates_once():
                         ad_clear(chat_id); send_ephemeral_html(chat_id, "广告已清空。", POPUP_EPHEMERAL_SECONDS)
                 elif data_s == "ACT_AD_SET_TIMES":
                     if is_chat_admin(chat_id, uid):
-                        try:
-                            ad_timepicker_open(chat_id, uid)
-                        except NameError:
-                            send_ephemeral_html(chat_id, "（时间选择器函数未引入，本按钮暂不可用）", POPUP_EPHEMERAL_SECONDS)
+                        ad_timepicker_open(chat_id, uid)
                 elif data_s == "ACT_AD_SET":
                     if is_chat_admin(chat_id, uid):
                         state_set(f"pending:set_ad_text:{chat_id}:{uid}", "1")
@@ -1268,12 +1319,8 @@ def process_updates_once():
                     else:
                         send_ephemeral_html(chat_id, "仅管理员可操作。", POPUP_EPHEMERAL_SECONDS)
 
-                # —— 时间选择器所有按钮 —— #
                 elif data_s.startswith("AT_"):
-                    try:
-                        ad_timepicker_handle(chat_id, uid, (msg.get("message_id") or 0), data_s, cb.get("id"))
-                    except NameError:
-                        send_ephemeral_html(chat_id, "（时间选择器函数未引入，本按钮暂不可用）", POPUP_EPHEMERAL_SECONDS)
+                    ad_timepicker_handle(chat_id, uid, (msg.get("message_id") or 0), data_s, cb.get("id"))
 
         except Exception as e:
             logger.exception("update handle error: %s", e)
@@ -1281,7 +1328,6 @@ def process_updates_once():
             if upd_id > offset:
                 offset = upd_id
                 _set_update_offset(offset)
-
 
 # ------------------------------- 启动主循环 -------------------------------
 def main():
@@ -1306,7 +1352,5 @@ def main():
         except Exception:
             logger.exception("updates loop error"); time.sleep(2)
 
-
 if __name__ == "__main__":
     main()
-
