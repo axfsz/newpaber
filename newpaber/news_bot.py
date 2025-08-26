@@ -491,6 +491,52 @@ def redeem_broadcast_success(chat_id:int, uid:int, u_amount:int):
     un,fn,ln=ensure_user_display(chat_id, uid, ("","",""))
     full=(f"{fn or ''} {ln or ''}").strip() or (f"@{un}" if un else f"ID:{uid}")
     send_message_html(chat_id, f"🎉 恭喜“{safe_html(full)}”兑换成功\n兑换金额：<b>{u_amount} U</b>")
+def admin_redeem_decide(chat_id: int, rid: int, approve: bool, admin_id: int):
+    """
+    管理员审批/拒绝兑换申请：
+    - approve=True  扣除所需积分（最多扣到 0），标记为 approved，并群内通知
+    - approve=False 不扣分，标记为 rejected，并群内通知
+    """
+    row = _fetchone(
+        "SELECT id, user_id, u_amount, status FROM redemptions WHERE id=%s AND chat_id=%s",
+        (rid, chat_id),
+    )
+    if not row:
+        send_ephemeral_html(chat_id, f"未找到兑换申请 #{rid}", POPUP_EPHEMERAL_SECONDS)
+        return
+
+    _, user_id, u_amount, status = row
+    status = (status or "").lower()
+    if status != "pending":
+        send_ephemeral_html(chat_id, f"兑换申请 #{rid} 已处理（{status}）。", POPUP_EPHEMERAL_SECONDS)
+        return
+
+    if approve:
+        need_pts = int(u_amount) * REDEEM_RATE
+        cur_pts = _get_points(chat_id, int(user_id))
+        deduct = min(cur_pts, need_pts)  # 防止出现负分
+        if deduct > 0:
+            _add_points(chat_id, int(user_id), -deduct, int(admin_id), "redeem_approve")
+        _exec(
+            "UPDATE redemptions SET status='approved', decided_by=%s, decided_at=%s WHERE id=%s",
+            (admin_id, utcnow().isoformat(), rid),
+        )
+        # 公告 & 回执
+        redeem_broadcast_success(chat_id, int(user_id), int(u_amount))
+        new_pts = _get_points(chat_id, int(user_id))
+        send_message_html(
+            chat_id,
+            f"✅ 兑换申请 #{rid} 已批准\n"
+            f"扣除积分：<b>{deduct}</b>（需求 {need_pts}）\n"
+            f"当前余额：<b>{new_pts}</b>",
+        )
+    else:
+        _exec(
+            "UPDATE redemptions SET status='rejected', decided_by=%s, decided_at=%s WHERE id=%s",
+            (admin_id, utcnow().isoformat(), rid),
+        )
+        send_message_html(chat_id, f"❌ 兑换申请 #{rid} 已拒绝。")
+
 
 # ====================== 邀请绑定/新人欢迎 ======================
 def _bind_invite_if_needed(chat_id:int, new_member:Dict, inviter:Dict):
