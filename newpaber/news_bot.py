@@ -598,9 +598,9 @@ def build_menu(is_admin_user:bool, chat_id:Optional[int]=None)->dict:
     kb=[
         [ikb("✅ 签到","ACT_CHECKIN")],
         [ikb("📌 我的积分","ACT_SCORE"), ikb("🏆 积分榜Top10","ACT_TOP10")],
-        [ikb("📊 今日统计","ACT_SD_TODAY"), ikb("📊 本月统计","ACT_SM_THIS")],
-        [ikb("📜 规则","ACT_RULES")],
-        [ikb("🎁 兑换U","ACT_REDEEM")],
+        [ikb("📊 今日发言统计","ACT_SD_TODAY"), ikb("📊 本月发言统计","ACT_SM_THIS")],
+        [ikb("📜 积分规则","ACT_RULES")],
+        [ikb("🎁 积分兑U","ACT_REDEEM")],
         [ikb("🆘 帮助","ACT_HELP")],
     ]
     if chat_id is not None and is_admin_user:
