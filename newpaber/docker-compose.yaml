@@ -11,12 +11,12 @@ services:
       LOG_LEVEL: ${LOG_LEVEL:-INFO}   # DEBUG/INFO/WARNING/ERROR
       LOG_JSON: ${LOG_JSON:-0}        # 1=JSON行日志
     volumes:
-      - ./news_bot.py:/app/news_bot.py:ro
+      - ./news_bot.py:/app/news_bot_patched.py:ro
       - ./data:/app/data
       - ./.env:/app/.env:ro
     command: >
       sh -lc "pip install -U requests feedparser beautifulsoup4 python-dateutil python-dotenv
-      pymysql deep-translator && python -u /app/news_bot.py"
+      pymysql deep-translator && python -u /app/news_bot_patched.py"
     restart: unless-stopped
     healthcheck:
       test: ["CMD", "python", "-c", "import os,urllib.request,sys;u='https://api.telegram.org/bot'+os.getenv('BOT_TOKEN','')+'/getMe';sys.exit(0) if urllib.request.urlopen(u,timeout=6).read() else sys.exit(1)"]
